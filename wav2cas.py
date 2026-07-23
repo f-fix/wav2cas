@@ -117,13 +117,14 @@ BAUD_TABLE = {
 # WAV reading
 # --------------------------------------------------------------------------
 
+
 def read_wav_mono(path):
     """Read a WAV file and return (samples, framerate).
 
     samples is a flat list of ints/floats, mono (channels averaged if the
     file is stereo/multi-channel), DC offset NOT removed (the edge detector
     below handles that implicitly via zero-crossing + hysteresis)."""
-    with wave.open(path, 'rb') as wf:
+    with wave.open(path, "rb") as wf:
         nchannels = wf.getnchannels()
         sampwidth = wf.getsampwidth()
         framerate = wf.getframerate()
@@ -135,7 +136,7 @@ def read_wav_mono(path):
     if nchannels > 1:
         mono = []
         for i in range(0, len(samples) - nchannels + 1, nchannels):
-            frame = samples[i:i + nchannels]
+            frame = samples[i : i + nchannels]
             mono.append(sum(frame) / nchannels)
         samples = mono
 
@@ -148,7 +149,7 @@ def _unpack_samples(raw, sampwidth):
         return [b - 128 for b in raw]
     elif sampwidth == 2:
         count = len(raw) // 2
-        return list(struct.unpack('<%dh' % count, raw[:count * 2]))
+        return list(struct.unpack("<%dh" % count, raw[: count * 2]))
     elif sampwidth == 3:
         count = len(raw) // 3
         out = [0] * count
@@ -161,7 +162,7 @@ def _unpack_samples(raw, sampwidth):
         return out
     elif sampwidth == 4:
         count = len(raw) // 4
-        return list(struct.unpack('<%di' % count, raw[:count * 4]))
+        return list(struct.unpack("<%di" % count, raw[: count * 4]))
     else:
         raise ValueError("Unsupported sample width: %d bytes" % sampwidth)
 
@@ -170,8 +171,15 @@ def _unpack_samples(raw, sampwidth):
 # Edge detection -> pulse (cycle) list
 # --------------------------------------------------------------------------
 
-def find_rising_edges(samples, threshold_ratio, agc=True,
-                       agc_attack=0.3, agc_release=0.0008, agc_floor_ratio=0.02):
+
+def find_rising_edges(
+    samples,
+    threshold_ratio,
+    agc=True,
+    agc_attack=0.3,
+    agc_release=0.0008,
+    agc_floor_ratio=0.02,
+):
     """Schmitt-trigger rising zero-crossing detector.
 
     Requires the signal to dip below -threshold before a new rising
@@ -253,6 +261,7 @@ def edges_to_periods(edges):
 # Bit / byte / block decoding
 # --------------------------------------------------------------------------
 
+
 def _best_baud_match(freq, tolerance):
     """Return (baud, f0, f1) for the baud rate whose bit-1 frequency is the
     closest relative match to freq, or None if none are within tolerance."""
@@ -284,12 +293,21 @@ def _trim_block_edges(data, confidences, threshold):
     return bytes(data[start:end]), list(confidences[start:end])
 
 
-def decode(periods, framerate, tolerance=0.30, min_pilot_pulses=40,
-           adapt=True, adapt_rate=0.1, adapt_clamp=0.35,
-           strict_stop=True, stop_bits=2,
-           edge_trim=True, edge_trim_threshold=0.5,
-           max_gap_multiple=3.0,
-           verbose=False):
+def decode(
+    periods,
+    framerate,
+    tolerance=0.30,
+    min_pilot_pulses=40,
+    adapt=True,
+    adapt_rate=0.1,
+    adapt_clamp=0.35,
+    strict_stop=True,
+    stop_bits=2,
+    edge_trim=True,
+    edge_trim_threshold=0.5,
+    max_gap_multiple=3.0,
+    verbose=False,
+):
     """Decode a list of cycle-length ("period", in samples) values into a
     list of (baud, bytes, confidence) blocks.
 
@@ -337,7 +355,7 @@ def decode(periods, framerate, tolerance=0.30, min_pilot_pulses=40,
     i = 0
     n = len(periods)
 
-    state = 'SEARCH'   # SEARCH -> SYNCED -> BYTE -> SYNCED -> ... -> SEARCH
+    state = "SEARCH"  # SEARCH -> SYNCED -> BYTE -> SYNCED -> ... -> SEARCH
     pilot_count = 0
     candidate = None
     baud = None
@@ -364,10 +382,10 @@ def decode(periods, framerate, tolerance=0.30, min_pilot_pulses=40,
 
     def classify(p):
         if p < threshold:
-            return 'short'
+            return "short"
         if p <= long_avg * max_gap_multiple:
-            return 'long'
-        return 'gap'
+            return "long"
+        return "gap"
 
     def pulse_confidence(p):
         gap = long_avg - short_avg
@@ -399,12 +417,12 @@ def decode(periods, framerate, tolerance=0.30, min_pilot_pulses=40,
             return None, idx, 0.0
         p = periods[idx]
         c = classify(p)
-        if c == 'long':
+        if c == "long":
             conf = pulse_confidence(p)
             update_long(p)
             return 0, idx + 1, conf
-        elif c == 'short':
-            if idx + 1 < n and classify(periods[idx + 1]) == 'short':
+        elif c == "short":
+            if idx + 1 < n and classify(periods[idx + 1]) == "short":
                 p2 = periods[idx + 1]
                 conf = (pulse_confidence(p) + pulse_confidence(p2)) / 2
                 update_short(p)
@@ -420,11 +438,15 @@ def decode(periods, framerate, tolerance=0.30, min_pilot_pulses=40,
         data = bytes(current)
         confs = list(current_confidences)
         if edge_trim:
-            trimmed_data, trimmed_confs = _trim_block_edges(data, confs, edge_trim_threshold)
+            trimmed_data, trimmed_confs = _trim_block_edges(
+                data, confs, edge_trim_threshold
+            )
             dropped = len(data) - len(trimmed_data)
             if dropped:
-                log("[trim] dropped %d low-confidence byte(s) from block edges "
-                    "(kept %d of %d)" % (dropped, len(trimmed_data), len(data)))
+                log(
+                    "[trim] dropped %d low-confidence byte(s) from block edges "
+                    "(kept %d of %d)" % (dropped, len(trimmed_data), len(data))
+                )
             data, confs = trimmed_data, trimmed_confs
         if not data:
             log("[block] entire block trimmed away as low-confidence noise")
@@ -436,7 +458,7 @@ def decode(periods, framerate, tolerance=0.30, min_pilot_pulses=40,
     while i < n:
         period = periods[i]
 
-        if state == 'SEARCH':
+        if state == "SEARCH":
             freq = framerate / period if period > 0 else 0
             match = _best_baud_match(freq, tolerance)
             if match is not None:
@@ -453,20 +475,22 @@ def decode(periods, framerate, tolerance=0.30, min_pilot_pulses=40,
                     long_avg = long_nom
                     short_avg = short_nom
                     threshold = (long_avg + short_avg) / 2
-                    log("[pilot] locked baud=%d (f0=%gHz f1=%gHz) near pulse %d"
-                        % (baud, f0, f1, i))
-                    state = 'SYNCED'
+                    log(
+                        "[pilot] locked baud=%d (f0=%gHz f1=%gHz) near pulse %d"
+                        % (baud, f0, f1, i)
+                    )
+                    state = "SYNCED"
                     ones_run = 0
                     flushed_this_run = False
             else:
                 pilot_count = 0
                 i += 1
 
-        elif state == 'SYNCED':
+        elif state == "SYNCED":
             # Either more pilot/mark ("1" bits, short pulses), the start
             # bit ("0", a long pulse) of a byte, or a dropout/silence gap.
             c = classify(period)
-            if c == 'short':
+            if c == "short":
                 update_short(period)
                 ones_run += 1
                 i += 1
@@ -477,7 +501,7 @@ def decode(periods, framerate, tolerance=0.30, min_pilot_pulses=40,
                 # then flush whatever we've accumulated so far exactly once
                 # for this run.
                 if ones_run >= min_pilot_pulses and not flushed_this_run:
-                    window = periods[max(0, i - min_pilot_pulses):i]
+                    window = periods[max(0, i - min_pilot_pulses) : i]
                     avg_period = sum(window) / len(window)
                     freq = framerate / avg_period if avg_period > 0 else 0
                     match = _best_baud_match(freq, tolerance)
@@ -488,19 +512,21 @@ def decode(periods, framerate, tolerance=0.30, min_pilot_pulses=40,
                         long_avg = long_nom
                         short_avg = short_nom
                         threshold = (long_avg + short_avg) / 2
-                        log("[pilot] re-locked baud=%d (f0=%gHz f1=%gHz) near pulse %d"
-                            % (baud, f0, f1, i))
+                        log(
+                            "[pilot] re-locked baud=%d (f0=%gHz f1=%gHz) near pulse %d"
+                            % (baud, f0, f1, i)
+                        )
                     flush_block()
                     current = bytearray()
                     current_confidences = []
                     flushed_this_run = True
-            elif c == 'long':
+            elif c == "long":
                 # Start bit of a byte. However much (or little) mark/idle
                 # tone preceded it, if a genuine new pilot wasn't already
                 # flushed above, current just keeps accumulating.
                 ones_run = 0
                 flushed_this_run = False
-                state = 'BYTE'
+                state = "BYTE"
                 # do not advance i - BYTE state re-reads this pulse as the start bit
             else:
                 # 'gap' - a dropout/silence stretch, not a genuine bit-0
@@ -516,14 +542,14 @@ def decode(periods, framerate, tolerance=0.30, min_pilot_pulses=40,
                 current_confidences = []
                 ones_run = 0
                 flushed_this_run = False
-                state = 'SEARCH'
+                state = "SEARCH"
                 pilot_count = 0
                 i += 1
 
-        elif state == 'BYTE':
+        elif state == "BYTE":
             start_bit, j, sconf = read_bit(i)
             if start_bit != 0:
-                state = 'SEARCH'
+                state = "SEARCH"
                 pilot_count = 0
                 i = j if start_bit is not None else i + 1
                 continue
@@ -537,11 +563,11 @@ def decode(periods, framerate, tolerance=0.30, min_pilot_pulses=40,
                 if bit is None:
                     ok = False
                     break
-                value |= (bit << bitpos)   # LSB first
+                value |= bit << bitpos  # LSB first
                 bit_confs.append(c)
                 i = j
             if not ok:
-                state = 'SEARCH'
+                state = "SEARCH"
                 pilot_count = 0
                 continue
 
@@ -554,13 +580,13 @@ def decode(periods, framerate, tolerance=0.30, min_pilot_pulses=40,
                     bit_confs.append(c)
                     i = j
                 if not ok:
-                    state = 'SEARCH'
+                    state = "SEARCH"
                     pilot_count = 0
                     continue
 
             current.append(value)
             current_confidences.append(sum(bit_confs) / len(bit_confs))
-            state = 'SYNCED'
+            state = "SYNCED"
             ones_run = 0
             flushed_this_run = False
 
@@ -573,17 +599,18 @@ def decode(periods, framerate, tolerance=0.30, min_pilot_pulses=40,
 # CAS output
 # --------------------------------------------------------------------------
 
+
 def write_cas(path, blocks, pad=False):
     """Write (baud, data, confidence) blocks to a .cas file, each preceded
     by the standard CAS block marker. If pad is True, 0-7 zero bytes are
     inserted before each marker so it lands at a file offset that's a
     multiple of 8."""
-    with open(path, 'wb') as f:
+    with open(path, "wb") as f:
         for _baud, data, _conf in blocks:
             if pad:
                 pad_len = (-f.tell()) % 8
                 if pad_len:
-                    f.write(b'\x00' * pad_len)
+                    f.write(b"\x00" * pad_len)
             f.write(CAS_HEADER)
             f.write(data)
 
@@ -599,8 +626,9 @@ def write_cas(path, blocks, pad=False):
 _TEST_FRAMERATE = 44100
 
 
-def _test_add_cycle(samples, freq, amp, framerate=_TEST_FRAMERATE,
-                     noise_amp=0.0, jitter=0.0, rng=None):
+def _test_add_cycle(
+    samples, freq, amp, framerate=_TEST_FRAMERATE, noise_amp=0.0, jitter=0.0, rng=None
+):
     rng = rng or random
     actual_freq = freq * (1 + rng.uniform(-jitter, jitter))
     n = max(2, int(round(framerate / actual_freq)))
@@ -610,9 +638,18 @@ def _test_add_cycle(samples, freq, amp, framerate=_TEST_FRAMERATE,
         samples.append(v)
 
 
-def _test_gen_block(samples, baud, payload, pilot_seconds, amp=20000,
-                     noise_amp=0.0, jitter=0.0, stop_bits=2, rng=None,
-                     framerate=_TEST_FRAMERATE):
+def _test_gen_block(
+    samples,
+    baud,
+    payload,
+    pilot_seconds,
+    amp=20000,
+    noise_amp=0.0,
+    jitter=0.0,
+    stop_bits=2,
+    rng=None,
+    framerate=_TEST_FRAMERATE,
+):
     f0, f1 = baud, baud * 2
     n_pilot_bits = int(pilot_seconds * baud)
     for _ in range(n_pilot_bits):
@@ -632,8 +669,9 @@ def _test_gen_block(samples, baud, payload, pilot_seconds, amp=20000,
             _test_add_cycle(samples, f1, amp, framerate, noise_amp, jitter, rng)
 
 
-def _test_decode_samples(samples, framerate=_TEST_FRAMERATE, threshold_ratio=0.2,
-                          agc=True, **decode_kwargs):
+def _test_decode_samples(
+    samples, framerate=_TEST_FRAMERATE, threshold_ratio=0.2, agc=True, **decode_kwargs
+):
     edges = find_rising_edges(samples, threshold_ratio, agc=agc)
     periods = edges_to_periods(edges)
     return decode(periods, framerate, **decode_kwargs)
@@ -676,7 +714,7 @@ def _t_strict_vs_lenient_stop_bits():
                 _test_add_cycle(samples, f1, 20000, rng=rng)
             else:
                 _test_add_cycle(samples, f0, 20000, rng=rng)
-        stop_n = 1 if idx % 2 == 0 else 3   # irregular: never the strict default of 2
+        stop_n = 1 if idx % 2 == 0 else 3  # irregular: never the strict default of 2
         for _ in range(stop_n):
             _test_add_cycle(samples, f1, 20000, rng=rng)
             _test_add_cycle(samples, f1, 20000, rng=rng)
@@ -687,18 +725,26 @@ def _t_strict_vs_lenient_stop_bits():
 
     problems = []
     if any(b[1] == payload for b in strict_blocks):
-        problems.append("strict mode unexpectedly decoded the full irregular-stop payload")
+        problems.append(
+            "strict mode unexpectedly decoded the full irregular-stop payload"
+        )
     if not any(b[1] == payload for b in lenient_blocks):
-        problems.append("lenient mode failed to decode the irregular-stop payload: got %r"
-                         % ([b[1] for b in lenient_blocks],))
+        problems.append(
+            "lenient mode failed to decode the irregular-stop payload: got %r"
+            % ([b[1] for b in lenient_blocks],)
+        )
     return (not problems), "; ".join(problems) or "ok"
 
 
 def _t_noise_jitter_tolerance():
     rng = random.Random(42)
     samples = []
-    _test_gen_block(samples, 1200, b"HEADERID", 1.0, noise_amp=0.15, jitter=0.08, rng=rng)
-    _test_gen_block(samples, 1200, bytes(range(256)), 0.3, noise_amp=0.15, jitter=0.08, rng=rng)
+    _test_gen_block(
+        samples, 1200, b"HEADERID", 1.0, noise_amp=0.15, jitter=0.08, rng=rng
+    )
+    _test_gen_block(
+        samples, 1200, bytes(range(256)), 0.3, noise_amp=0.15, jitter=0.08, rng=rng
+    )
     samples += [0] * int(_TEST_FRAMERATE * 0.3)
 
     blocks = _test_decode_samples(samples)
@@ -728,8 +774,10 @@ def _t_agc_recovers_quiet_block():
     if payload_loud not in agc_payloads or payload_quiet not in agc_payloads:
         return False, "AGC failed to recover both payloads: got %r" % (agc_payloads,)
     if payload_quiet in noagc_payloads:
-        return False, ("no-agc unexpectedly recovered the quiet payload too - "
-                        "test isn't discriminating, needs a bigger amplitude gap")
+        return False, (
+            "no-agc unexpectedly recovered the quiet payload too - "
+            "test isn't discriminating, needs a bigger amplitude gap"
+        )
     return True, "ok"
 
 
@@ -749,8 +797,10 @@ def _t_gap_does_not_produce_spurious_byte():
     blocks = _test_decode_samples(samples)
     payloads = [b[1] for b in blocks]
     if payload1 not in payloads:
-        return False, ("block 1 wasn't decoded cleanly (a gap-induced spurious byte would "
-                        "show up here): got %r" % (payloads,))
+        return False, (
+            "block 1 wasn't decoded cleanly (a gap-induced spurious byte would "
+            "show up here): got %r" % (payloads,)
+        )
     if payload2 not in payloads:
         return False, "block 2 wasn't decoded cleanly: got %r" % (payloads,)
     return True, "ok"
@@ -759,9 +809,13 @@ def _t_gap_does_not_produce_spurious_byte():
 def _t_confidence_filtering():
     rng = random.Random(99)
     samples = []
-    _test_gen_block(samples, 1200, b"CLEANMSG", 0.5, noise_amp=0.02, jitter=0.01, rng=rng)
+    _test_gen_block(
+        samples, 1200, b"CLEANMSG", 0.5, noise_amp=0.02, jitter=0.01, rng=rng
+    )
     samples += [0] * 300
-    _test_gen_block(samples, 1200, b"GARBLED!", 0.5, noise_amp=0.35, jitter=0.25, rng=rng)
+    _test_gen_block(
+        samples, 1200, b"GARBLED!", 0.5, noise_amp=0.35, jitter=0.25, rng=rng
+    )
     samples += [0] * int(_TEST_FRAMERATE * 0.2)
 
     blocks = _test_decode_samples(samples)
@@ -773,8 +827,10 @@ def _t_confidence_filtering():
     if clean[2] < 0.85:
         return False, "clean block confidence unexpectedly low: %.3f" % clean[2]
     if garbled[2] >= clean[2]:
-        return False, ("garbled block confidence (%.3f) not lower than clean block's (%.3f)"
-                        % (garbled[2], clean[2]))
+        return False, (
+            "garbled block confidence (%.3f) not lower than clean block's (%.3f)"
+            % (garbled[2], clean[2])
+        )
     kept = [b for b in blocks if b[2] >= 0.85]
     if garbled in kept:
         return False, "garbled block incorrectly passed a 0.85 confidence threshold"
@@ -782,7 +838,7 @@ def _t_confidence_filtering():
 
 
 def _t_edge_trim_mixed_confidence():
-    data = bytes([0xFF, 0xFE, ord('H'), ord('I'), 0xFD])
+    data = bytes([0xFF, 0xFE, ord("H"), ord("I"), 0xFD])
     confs = [0.1, 0.2, 0.95, 0.93, 0.15]
     trimmed_data, trimmed_confs = _trim_block_edges(data, confs, 0.5)
     if trimmed_data != b"HI":
@@ -797,14 +853,17 @@ def _t_edge_trim_all_low_confidence():
     confs = [0.1, 0.2, 0.05]
     trimmed_data, trimmed_confs = _trim_block_edges(data, confs, 0.5)
     if trimmed_data != b"" or trimmed_confs != []:
-        return False, "expected an empty result, got %r / %r" % (trimmed_data, trimmed_confs)
+        return False, "expected an empty result, got %r / %r" % (
+            trimmed_data,
+            trimmed_confs,
+        )
     return True, "ok"
 
 
 def _t_edge_trim_untouched_interior():
     # a low-confidence byte in the *middle* must NOT be removed - trimming
     # only ever eats inward from the two ends.
-    data = bytes([ord('A'), 0x00, ord('B')])
+    data = bytes([ord("A"), 0x00, ord("B")])
     confs = [0.9, 0.1, 0.9]
     trimmed_data, trimmed_confs = _trim_block_edges(data, confs, 0.5)
     if trimmed_data != data or trimmed_confs != confs:
@@ -817,7 +876,7 @@ def _t_pad_alignment():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "test.cas")
         write_cas(path, blocks, pad=True)
-        with open(path, 'rb') as f:
+        with open(path, "rb") as f:
             data = f.read()
 
     offsets = []
@@ -844,7 +903,10 @@ _SELF_TESTS = [
     ("strict vs. lenient stop bits", _t_strict_vs_lenient_stop_bits),
     ("noise & jitter tolerance", _t_noise_jitter_tolerance),
     ("AGC recovers a quiet block", _t_agc_recovers_quiet_block),
-    ("gap/dropout doesn't produce a spurious byte", _t_gap_does_not_produce_spurious_byte),
+    (
+        "gap/dropout doesn't produce a spurious byte",
+        _t_gap_does_not_produce_spurious_byte,
+    ),
     ("confidence-based block filtering", _t_confidence_filtering),
     ("edge trim: mixed confidence", _t_edge_trim_mixed_confidence),
     ("edge trim: all low confidence", _t_edge_trim_all_low_confidence),
@@ -860,8 +922,14 @@ def run_self_tests():
             ok, msg = fn()
         except Exception as e:
             ok, msg = False, "exception: %r" % (e,)
-        print("[%s] %s%s" % ("PASS" if ok else "FAIL", name,
-                              "" if (not msg or msg == "ok") else (" - " + msg)))
+        print(
+            "[%s] %s%s"
+            % (
+                "PASS" if ok else "FAIL",
+                name,
+                "" if (not msg or msg == "ok") else (" - " + msg),
+            )
+        )
         if ok:
             passed += 1
         else:
@@ -874,78 +942,147 @@ def run_self_tests():
 # Main
 # --------------------------------------------------------------------------
 
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Decode MSX cassette audio (WAV) into a .CAS file.")
-    parser.add_argument('input', nargs='?', help="input .wav file")
-    parser.add_argument('output', nargs='?', help="output .cas file")
-    parser.add_argument('--tolerance', type=float, default=0.30,
-                         help="relative frequency tolerance used only for initial pilot-tone "
-                              "baud detection, as a fraction (default: 0.30)")
-    parser.add_argument('--min-pilot-pulses', type=int, default=40,
-                         help="consecutive pilot pulses required to lock onto a baud rate, "
-                              "and to distinguish a genuine new pilot tone from ordinary "
-                              "inter-byte mark time (default: 40)")
-    parser.add_argument('--threshold-ratio', type=float, default=0.2,
-                         help="Schmitt-trigger threshold as a fraction of the (local, if AGC "
-                              "is enabled) amplitude envelope (default: 0.2)")
-    parser.add_argument('--no-agc', action='store_true',
-                         help="disable local amplitude tracking (AGC) and use one fixed "
-                              "threshold based on the whole file's peak amplitude instead")
-    parser.add_argument('--agc-attack', type=float, default=0.3,
-                         help="how quickly the AGC envelope rises to follow increasing "
-                              "amplitude, 0-1 (default: 0.3)")
-    parser.add_argument('--agc-release', type=float, default=0.0008,
-                         help="how quickly the AGC envelope falls to follow decreasing "
-                              "amplitude, 0-1 (default: 0.0008)")
-    parser.add_argument('--agc-floor-ratio', type=float, default=0.02,
-                         help="floor for the AGC envelope, as a fraction of the file's overall "
-                              "peak amplitude, so quiet/silent stretches don't let the "
-                              "threshold collapse and trigger on noise (default: 0.02)")
-    parser.add_argument('--no-adapt', action='store_true',
-                         help="disable the adaptive long/short threshold tracking and use "
-                              "fixed nominal cycle lengths for the whole file")
-    parser.add_argument('--adapt-rate', type=float, default=0.1,
-                         help="how quickly the adaptive threshold tracks measured pulse "
-                              "lengths, 0-1 (default: 0.1)")
-    parser.add_argument('--adapt-clamp', type=float, default=0.35,
-                         help="maximum fractional deviation from the nominal cycle length "
-                              "the adaptive threshold is allowed to track (default: 0.35)")
-    parser.add_argument('--lenient-stop-bits', action='store_true',
-                         help="don't require a fixed number of stop bits after each byte - "
-                              "just accept whatever mark/idle tone (if any) precedes the next "
-                              "start bit. Default is strict (see --stop-bits)")
-    parser.add_argument('--stop-bits', type=int, default=2,
-                         help="number of stop bits required per byte in strict mode "
-                              "(default: 2, matching the MSX BIOS cassette routines; ignored "
-                              "if --lenient-stop-bits is given)")
-    parser.add_argument('--min-confidence', type=float, default=0.8,
-                         help="blocks with an average confidence below this (0-1) are left "
-                              "out of the output file (default: 0.8)")
-    parser.add_argument('--no-edge-trim', action='store_true',
-                         help="disable automatic trimming of low-confidence bytes from the "
-                              "start/end of an otherwise good block (see --edge-trim-threshold)")
-    parser.add_argument('--edge-trim-threshold', type=float, default=0.5,
-                         help="bytes at the very start/end of a block with confidence below "
-                              "this (0-1) are dropped, stopping at the first byte that meets "
-                              "it - catches stray bytes from noise at a block boundary without "
-                              "touching the block's interior (default: 0.5)")
-    parser.add_argument('--max-gap-multiple', type=float, default=3.0,
-                         help="a pulse longer than this many times the current long-cycle "
-                              "reference is treated as a dropout/silence gap rather than a "
-                              "genuine bit-0 cycle, forcing a resync via the pilot search "
-                              "instead of risking it being misread as a start bit "
-                              "(default: 3.0)")
-    parser.add_argument('--pad', action='store_true',
-                         help="insert 0-7 zero-byte padding before each CAS block header so "
-                              "the header starts at a file offset that's a multiple of 8 "
-                              "(some MSX tools expect this; default: off)")
-    parser.add_argument('--test', action='store_true',
-                         help="run the internal self-test suite and exit (no input/output "
-                              "files needed) - use this after making changes to check for "
-                              "regressions")
-    parser.add_argument('-v', '--verbose', action='store_true',
-                         help="print decoding progress to stderr")
+        description="Decode MSX cassette audio (WAV) into a .CAS file."
+    )
+    parser.add_argument("input", nargs="?", help="input .wav file")
+    parser.add_argument("output", nargs="?", help="output .cas file")
+    parser.add_argument(
+        "--tolerance",
+        type=float,
+        default=0.30,
+        help="relative frequency tolerance used only for initial pilot-tone "
+        "baud detection, as a fraction (default: 0.30)",
+    )
+    parser.add_argument(
+        "--min-pilot-pulses",
+        type=int,
+        default=40,
+        help="consecutive pilot pulses required to lock onto a baud rate, "
+        "and to distinguish a genuine new pilot tone from ordinary "
+        "inter-byte mark time (default: 40)",
+    )
+    parser.add_argument(
+        "--threshold-ratio",
+        type=float,
+        default=0.2,
+        help="Schmitt-trigger threshold as a fraction of the (local, if AGC "
+        "is enabled) amplitude envelope (default: 0.2)",
+    )
+    parser.add_argument(
+        "--no-agc",
+        action="store_true",
+        help="disable local amplitude tracking (AGC) and use one fixed "
+        "threshold based on the whole file's peak amplitude instead",
+    )
+    parser.add_argument(
+        "--agc-attack",
+        type=float,
+        default=0.3,
+        help="how quickly the AGC envelope rises to follow increasing "
+        "amplitude, 0-1 (default: 0.3)",
+    )
+    parser.add_argument(
+        "--agc-release",
+        type=float,
+        default=0.0008,
+        help="how quickly the AGC envelope falls to follow decreasing "
+        "amplitude, 0-1 (default: 0.0008)",
+    )
+    parser.add_argument(
+        "--agc-floor-ratio",
+        type=float,
+        default=0.02,
+        help="floor for the AGC envelope, as a fraction of the file's overall "
+        "peak amplitude, so quiet/silent stretches don't let the "
+        "threshold collapse and trigger on noise (default: 0.02)",
+    )
+    parser.add_argument(
+        "--no-adapt",
+        action="store_true",
+        help="disable the adaptive long/short threshold tracking and use "
+        "fixed nominal cycle lengths for the whole file",
+    )
+    parser.add_argument(
+        "--adapt-rate",
+        type=float,
+        default=0.1,
+        help="how quickly the adaptive threshold tracks measured pulse "
+        "lengths, 0-1 (default: 0.1)",
+    )
+    parser.add_argument(
+        "--adapt-clamp",
+        type=float,
+        default=0.35,
+        help="maximum fractional deviation from the nominal cycle length "
+        "the adaptive threshold is allowed to track (default: 0.35)",
+    )
+    parser.add_argument(
+        "--lenient-stop-bits",
+        action="store_true",
+        help="don't require a fixed number of stop bits after each byte - "
+        "just accept whatever mark/idle tone (if any) precedes the next "
+        "start bit. Default is strict (see --stop-bits)",
+    )
+    parser.add_argument(
+        "--stop-bits",
+        type=int,
+        default=2,
+        help="number of stop bits required per byte in strict mode "
+        "(default: 2, matching the MSX BIOS cassette routines; ignored "
+        "if --lenient-stop-bits is given)",
+    )
+    parser.add_argument(
+        "--min-confidence",
+        type=float,
+        default=0.8,
+        help="blocks with an average confidence below this (0-1) are left "
+        "out of the output file (default: 0.8)",
+    )
+    parser.add_argument(
+        "--no-edge-trim",
+        action="store_true",
+        help="disable automatic trimming of low-confidence bytes from the "
+        "start/end of an otherwise good block (see --edge-trim-threshold)",
+    )
+    parser.add_argument(
+        "--edge-trim-threshold",
+        type=float,
+        default=0.5,
+        help="bytes at the very start/end of a block with confidence below "
+        "this (0-1) are dropped, stopping at the first byte that meets "
+        "it - catches stray bytes from noise at a block boundary without "
+        "touching the block's interior (default: 0.5)",
+    )
+    parser.add_argument(
+        "--max-gap-multiple",
+        type=float,
+        default=3.0,
+        help="a pulse longer than this many times the current long-cycle "
+        "reference is treated as a dropout/silence gap rather than a "
+        "genuine bit-0 cycle, forcing a resync via the pilot search "
+        "instead of risking it being misread as a start bit "
+        "(default: 3.0)",
+    )
+    parser.add_argument(
+        "--pad",
+        action="store_true",
+        help="insert 0-7 zero-byte padding before each CAS block header so "
+        "the header starts at a file offset that's a multiple of 8 "
+        "(some MSX tools expect this; default: off)",
+    )
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="run the internal self-test suite and exit (no input/output "
+        "files needed) - use this after making changes to check for "
+        "regressions",
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="print decoding progress to stderr"
+    )
     args = parser.parse_args()
 
     if args.test:
@@ -958,53 +1095,74 @@ def main():
     samples, framerate = read_wav_mono(args.input)
     print("%d samples at %d Hz" % (len(samples), framerate), file=sys.stderr)
 
-    edges = find_rising_edges(samples, args.threshold_ratio,
-                               agc=not args.no_agc,
-                               agc_attack=args.agc_attack,
-                               agc_release=args.agc_release,
-                               agc_floor_ratio=args.agc_floor_ratio)
+    edges = find_rising_edges(
+        samples,
+        args.threshold_ratio,
+        agc=not args.no_agc,
+        agc_attack=args.agc_attack,
+        agc_release=args.agc_release,
+        agc_floor_ratio=args.agc_floor_ratio,
+    )
     print("%d rising edges detected" % len(edges), file=sys.stderr)
 
     periods = edges_to_periods(edges)
 
-    blocks = decode(periods, framerate,
-                     tolerance=args.tolerance,
-                     min_pilot_pulses=args.min_pilot_pulses,
-                     adapt=not args.no_adapt,
-                     adapt_rate=args.adapt_rate,
-                     adapt_clamp=args.adapt_clamp,
-                     strict_stop=not args.lenient_stop_bits,
-                     stop_bits=args.stop_bits,
-                     edge_trim=not args.no_edge_trim,
-                     edge_trim_threshold=args.edge_trim_threshold,
-                     max_gap_multiple=args.max_gap_multiple,
-                     verbose=args.verbose)
+    blocks = decode(
+        periods,
+        framerate,
+        tolerance=args.tolerance,
+        min_pilot_pulses=args.min_pilot_pulses,
+        adapt=not args.no_adapt,
+        adapt_rate=args.adapt_rate,
+        adapt_clamp=args.adapt_clamp,
+        strict_stop=not args.lenient_stop_bits,
+        stop_bits=args.stop_bits,
+        edge_trim=not args.no_edge_trim,
+        edge_trim_threshold=args.edge_trim_threshold,
+        max_gap_multiple=args.max_gap_multiple,
+        verbose=args.verbose,
+    )
 
     if not blocks:
-        print("No data blocks decoded - try adjusting --tolerance, --min-pilot-pulses, "
-              "--threshold-ratio, or --lenient-stop-bits", file=sys.stderr)
+        print(
+            "No data blocks decoded - try adjusting --tolerance, --min-pilot-pulses, "
+            "--threshold-ratio, or --lenient-stop-bits",
+            file=sys.stderr,
+        )
 
     kept = [b for b in blocks if b[2] >= args.min_confidence]
 
     if not kept:
-        print("No blocks met the --min-confidence threshold (%.2f) - nothing written to %s"
-              % (args.min_confidence, args.output), file=sys.stderr)
+        print(
+            "No blocks met the --min-confidence threshold (%.2f) - nothing written to %s"
+            % (args.min_confidence, args.output),
+            file=sys.stderr,
+        )
         for idx, (baud, data, conf) in enumerate(blocks):
-            print("  block %d: baud=%d bytes=%d confidence=%.3f [DROPPED (below threshold)]"
-                  % (idx, baud, len(data), conf), file=sys.stderr)
+            print(
+                "  block %d: baud=%d bytes=%d confidence=%.3f [DROPPED (below threshold)]"
+                % (idx, baud, len(data), conf),
+                file=sys.stderr,
+            )
         sys.exit(1)
 
     write_cas(args.output, kept, pad=args.pad)
 
-    print("Decoded %d block(s), wrote %d (min-confidence=%.2f):"
-          % (len(blocks), len(kept), args.min_confidence), file=sys.stderr)
+    print(
+        "Decoded %d block(s), wrote %d (min-confidence=%.2f):"
+        % (len(blocks), len(kept), args.min_confidence),
+        file=sys.stderr,
+    )
     for idx, (baud, data, conf) in enumerate(blocks):
         status = "kept" if conf >= args.min_confidence else "DROPPED (below threshold)"
-        print("  block %d: baud=%d bytes=%d confidence=%.3f [%s]"
-              % (idx, baud, len(data), conf, status), file=sys.stderr)
+        print(
+            "  block %d: baud=%d bytes=%d confidence=%.3f [%s]"
+            % (idx, baud, len(data), conf, status),
+            file=sys.stderr,
+        )
 
     print("Wrote %s" % args.output, file=sys.stderr)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
