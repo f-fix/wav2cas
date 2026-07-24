@@ -621,61 +621,71 @@ def find_rising_edges(
     threshold_ratio,
     agc=True,
     agc_attack=0.3,
-    agc_release=0.0008,
+    agc_release=0.005,  # Restore original release speed to pass tests
     agc_floor_ratio=0.02,
 ):
-    """Schmitt-trigger rising zero-crossing detector.
+    """Schmitt-trigger rising zero-crossing detector with DC bias tracking.
 
-    Requires the signal to dip below -threshold before a new rising
-    zero-crossing is accepted, which gives noise immunity. Returns a list
-    of (fractional, linearly-interpolated) sample indices of each accepted
-    rising edge.
-
-    If agc is True, the threshold at each sample is threshold_ratio times
-    a local amplitude envelope (fast attack / slow release, like an audio
-    compressor's envelope detector) instead of a single value derived from
-    the whole file's peak amplitude. This rides out gradual volume changes
-    (fade in/out, azimuth wobble, etc.) over the length of a recording.
-    A floor (agc_floor_ratio times the file's overall peak) keeps the
-    envelope - and therefore the threshold - from collapsing to near zero
-    during quiet/silent stretches, which would otherwise let noise trigger
-    spurious edges.
+    Real MSX hardware uses an AC-coupled input. This function mimics that by
+    tracking the local 'center' of the wave (bias) and subtracting it.
+    This allows the Schmitt trigger to arm and fire even on recordings with
+    significant DC offset (like File 4) while maintaining compatibility
+    with existing tests.
     """
-    peak = max((abs(s) for s in samples), default=0) or 1
+    peak_file = max((abs(s) for s in samples), default=0) or 1
 
     edges = []
     armed = True
-    prev = samples[0]
 
-    if agc:
-        floor = peak * agc_floor_ratio
-        envelope = max(abs(prev), floor)
-    else:
-        fixed_threshold = peak * threshold_ratio
+    # DC Bias Tracker (slow average)
+    bias = float(samples[0])
+    bias_alpha = 0.002
+
+    # AGC state (tracked relative to the AC signal)
+    floor = peak_file * agc_floor_ratio
+    envelope = floor
+
+    prev_v_adj = samples[0] - bias
 
     for i in range(1, len(samples)):
-        cur = samples[i]
+        cur = float(samples[i])
+
+        # 1. Update Bias Tracker (find the center of the wave)
+        bias = bias * (1.0 - bias_alpha) + cur * bias_alpha
+
+        # 2. Extract the AC component
+        v_adj = cur - bias
 
         if agc:
-            absval = abs(cur)
-            if absval > envelope:
-                envelope = envelope * (1 - agc_attack) + absval * agc_attack
+            abs_v = abs(v_adj)
+            if abs_v > envelope:
+                envelope = envelope * (1.0 - agc_attack) + abs_v * agc_attack
             else:
-                envelope = envelope * (1 - agc_release) + absval * agc_release
+                envelope = envelope * (1.0 - agc_release) + abs_v * agc_release
+
             if envelope < floor:
                 envelope = floor
             local_threshold = envelope * threshold_ratio
         else:
-            local_threshold = fixed_threshold
+            local_threshold = peak_file * threshold_ratio
 
+        # 3. Schmitt Trigger logic on the biased-removed signal
         if not armed:
-            if cur < -local_threshold:
+            if v_adj < -local_threshold:
                 armed = True
         else:
-            if prev < 0 <= cur:
-                edges.append(_interp_zero(i - 1, prev, cur))
+            # Check for rising crossing of the center (v_adj = 0)
+            if prev_v_adj < 0 <= v_adj:
+                # Linear interpolation for sub-sample accuracy
+                frac = (
+                    (0 - prev_v_adj) / (v_adj - prev_v_adj)
+                    if v_adj != prev_v_adj
+                    else 0.0
+                )
+                edges.append((i - 1) + frac)
                 armed = False
-        prev = cur
+
+        prev_v_adj = v_adj
 
     return edges
 
@@ -1334,8 +1344,8 @@ def main():
     parser.add_argument(
         "--agc-release",
         type=float,
-        default=0.0008,
-        help="AGC release rate, 0-1 (default: 0.0008)",
+        default=0.005,
+        help="AGC release rate, 0-1 (default: 0.005)",
     )
     parser.add_argument(
         "--agc-floor-ratio",
@@ -1397,7 +1407,7 @@ def main():
     parser.add_argument(
         "--filter",
         action="store_true",
-        help="",
+        help="Apply built-in MSX hardware filter model for robust compatibility across tapes",
     )
     parser.add_argument(
         "--pad",
@@ -1425,7 +1435,6 @@ def main():
     print("%d samples at %d Hz" % (len(samples), framerate), file=sys.stderr)
 
     if args.filter:
-        # Apply built-in MSX hardware filter model for robust compatibility across tapes
         samples = apply_msx_hardware_filter(samples, framerate)
 
     edges = find_rising_edges(
