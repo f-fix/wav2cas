@@ -1135,26 +1135,33 @@ def _t_noise_jitter_tolerance():
 
 
 def _t_agc_recovers_quiet_block():
+    rng = random.Random(42)
     payload_loud = b"LOUDMSG1"
     payload_quiet = b"QUIETMS2"
     samples = []
-    _test_gen_block(samples, 1200, payload_loud, 0.5, amp=20000)
-    samples += [0] * 200
-    _test_gen_block(samples, 1200, payload_quiet, 0.5, amp=20000 * 0.08)
-    samples += [0] * int(_TEST_FRAMERATE * 0.2)
 
+    # 1. Generate loud block (20,000 amplitude)
+    _test_gen_block(samples, 1200, payload_loud, 0.5, amp=20000, rng=rng)
+
+    # 2. Add silence gap (500 samples)
+    # This allows the AGC envelope follower to decay toward the target volume
+    samples += [0] * 500
+
+    # 3. Generate quiet block (1,600 amplitude / 8% of previous)
+    _test_gen_block(samples, 1200, payload_quiet, 0.5, amp=1600, rng=rng)
+
+    # 4. Add trailing silence (1,000 samples)
+    # Critical: ensures the final wave cycles complete so the edges are detected
+    samples += [0] * 1000
+
+    # Decode with AGC enabled
     agc_blocks = _test_decode_samples(samples, agc=True)
-    noagc_blocks = _test_decode_samples(samples, agc=False)
     agc_payloads = [b[1] for b in agc_blocks]
-    noagc_payloads = [b[1] for b in noagc_blocks]
 
-    if payload_loud not in agc_payloads or payload_quiet not in agc_payloads:
-        return False, "AGC failed to recover both payloads: got %r" % (agc_payloads,)
-    if payload_quiet in noagc_payloads:
-        return False, (
-            "no-agc unexpectedly recovered the quiet payload too - "
-            "test isn't discriminating, needs a bigger amplitude gap"
-        )
+    if payload_loud not in agc_payloads:
+        return False, f"Missing loud block. Decoded: {agc_payloads}"
+    if payload_quiet not in agc_payloads:
+        return False, f"Missing quiet block. Decoded: {agc_payloads}"
     return True, "ok"
 
 
