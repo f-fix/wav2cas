@@ -6,7 +6,7 @@ Pure Python, standard library only.
 ## Usage
 
 ```
-python3 wav2cas.py input.wav output.cas [options]
+python3 wav2cas.py [--filter] input.wav output.cas [options]
 ```
 
 Run `python3 wav2cas.py --help` for the full list of options (baud rate is
