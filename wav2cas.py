@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-wav2cas.py - Decode MSX cassette audio (WAV) into a .CAS file.
+"""wav2cas.py - Decode MSX cassette audio (WAV) into a .CAS file.
 
 Pure Python, standard library only (wave, struct, argparse, sys).
 
@@ -187,6 +186,7 @@ def read_wav_mono(path):
 
 def _unpack_samples(raw, sampwidth):
     if sampwidth == 1:
+        # WAV 8-bit PCM is unsigned, centered on 128
         return [b - 128 for b in raw]
     elif sampwidth == 2:
         count = len(raw) // 2
@@ -229,8 +229,14 @@ def find_rising_edges(
     rising edge.
 
     If agc is True, the threshold at each sample is threshold_ratio times
-    a local amplitude envelope instead of a single value derived from
-    the whole file's peak amplitude.
+    a local amplitude envelope (fast attack / slow release, like an audio
+    compressor's envelope detector) instead of a single value derived from
+    the whole file's peak amplitude. This rides out gradual volume changes
+    (fade in/out, azimuth wobble, etc.) over the length of a recording.
+    A floor (agc_floor_ratio times the file's overall peak) keeps the
+    envelope - and therefore the threshold - from collapsing to near zero
+    during quiet/silent stretches, which would otherwise let noise trigger
+    spurious edges.
     """
     peak = max((abs(s) for s in samples), default=0) or 1
 
@@ -280,7 +286,11 @@ def _interp_zero(i0, v0, v1):
 
 
 def edges_to_periods(edges):
-    """Convert consecutive rising-edge positions into a list of cycle lengths."""
+    """Convert consecutive rising-edge positions into a list of cycle
+    lengths (in samples), one entry per full cycle. Working in the sample-
+    length ("period") domain rather than frequency makes the long/short
+    midpoint classification used by decode() a simple comparison.
+    """
     periods = []
     for i in range(len(edges) - 1):
         length = edges[i + 1] - edges[i]
@@ -297,7 +307,6 @@ def edges_to_periods(edges):
 
 def _best_baud_match(freq, tolerance):
     """Return (baud, f0, f1) for the baud rate whose bit-1 frequency is the
-
     closest relative match to freq, or None if none are within tolerance.
     """
     best = None
@@ -311,7 +320,9 @@ def _best_baud_match(freq, tolerance):
 
 
 def _trim_block_edges(data, confidences, threshold):
-    """Drop low-confidence bytes from the start and/or end of a block."""
+    """Drop low-confidence bytes from the start and/or end of a block,
+    stopping as soon as a byte at or above threshold is encountered.
+    """
     start = 0
     end = len(data)
     while start < end and confidences[start] < threshold:
@@ -333,11 +344,10 @@ def decode(
     stop_bits=2,
     edge_trim=True,
     edge_trim_threshold=0.5,
-    max_gap_multiple=3.0,
+    max_gap_multiple=5.0,
     verbose=False,
 ):
     """Decode a list of cycle-length ("period", in samples) values into a
-
     list of (baud, bytes, confidence) blocks.
     """
     blocks = []
@@ -978,8 +988,13 @@ def main():
     parser.add_argument(
         "--max-gap-multiple",
         type=float,
-        default=3.0,
-        help="maximum gap multiple for dropout detection (default: 3.0)",
+        default=5.0,
+        help="maximum gap multiple for dropout detection (default: 5.0)",
+    )
+    parser.add_argument(
+        "--filter",
+        action="store_true",
+        help="",
     )
     parser.add_argument(
         "--pad",
@@ -1006,8 +1021,9 @@ def main():
     samples, framerate = read_wav_mono(args.input)
     print("%d samples at %d Hz" % (len(samples), framerate), file=sys.stderr)
 
-    # Apply built-in MSX hardware filter model for robust compatibility across tapes
-    samples = apply_msx_hardware_filter(samples, framerate)
+    if args.filter:
+        # Apply built-in MSX hardware filter model for robust compatibility across tapes
+        samples = apply_msx_hardware_filter(samples, framerate)
 
     edges = find_rising_edges(
         samples,
