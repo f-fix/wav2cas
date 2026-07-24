@@ -541,34 +541,42 @@ def open_via_ffmpeg_as_wav(file_path):
     return DirectWavReader(temp_wav.name, wav_obj)
 
 
-def open_wave_or_flac_for_reading(path):
-    try:
-        # should be fast when it works at all, and supports more
-        # formats
-        return open_via_ffmpeg_as_wav(path)
-    except:
-        pass
-    try:
-        # very slow but lets us use FLAC where we otherwise could not
-        return open_flac_as_wav(path)
-    except:
-        pass
+def open_wave_or_flac_for_reading(path, allow_native_formats=True):
+    if allow_native_formats:
+        try:
+            # should be fast when it works at all, and supports more
+            # formats
+            return open_via_ffmpeg_as_wav(path)
+        except Exception:
+            pass
+        try:
+            # very slow but lets us use FLAC where we otherwise could not
+            return open_flac_as_wav(path)
+        except Exception:
+            pass
     # normal WAV-only path, limited to old "traditional" Windows WAV
     # codec support (8bit unsigned/16bit signed PCM)
     return wave.open(path, "rb")
 
 
-def read_wav_mono(path):
+def read_wav_mono(path, allow_native_formats=True):
     """Read a WAV file and return (samples, framerate). FLAC also
     works, possibly much more slowly. other formats may also work if
     you have ffmpeg installed and available on your PATH.
+
+    If allow_native_formats is False, the ffmpeg/FLAC fallbacks are
+    skipped entirely and the file is read as plain WAV via the stdlib
+    `wave` module only - no `subprocess` call is made. Use this if you'd
+    rather convert non-WAV sources to WAV yourself ahead of time (e.g. via
+    your own `ffmpeg` invocation) than have this tool shell out to ffmpeg
+    on your behalf.
 
     samples is a flat list of ints/floats, mono (channels averaged if the
     file is stereo/multi-channel), DC offset NOT removed (the edge detector
     below handles that implicitly via zero-crossing + hysteresis).
 
     """
-    with open_wave_or_flac_for_reading(path) as wf:
+    with open_wave_or_flac_for_reading(path, allow_native_formats) as wf:
         nchannels = wf.getnchannels()
         sampwidth = wf.getsampwidth()
         framerate = wf.getframerate()
@@ -1412,6 +1420,13 @@ def main():
         help="maximum gap multiple for dropout detection (default: 5.0)",
     )
     parser.add_argument(
+        "--no-native-formats",
+        action="store_true",
+        help="skip the built-in FLAC/ffmpeg support and read the input as plain WAV only via "
+        "the stdlib `wave` module - no `subprocess` call is made. Use this if you'd rather "
+        "convert a non-WAV source to WAV yourself first (e.g. with your own ffmpeg command)",
+    )
+    parser.add_argument(
         "--filter",
         action="store_true",
         help="Apply built-in MSX hardware filter model for robust compatibility across tapes",
@@ -1438,7 +1453,9 @@ def main():
         parser.error("input and output are required (unless --test is given)")
 
     print("Reading %s ..." % args.input, file=sys.stderr)
-    samples, framerate = read_wav_mono(args.input)
+    samples, framerate = read_wav_mono(
+        args.input, allow_native_formats=not args.no_native_formats
+    )
     print("%d samples at %d Hz" % (len(samples), framerate), file=sys.stderr)
 
     if args.filter:
