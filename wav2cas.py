@@ -90,10 +90,12 @@ LIMITATIONS:
 """
 
 import argparse
+import io
 import math
 import os
 import random
 import struct
+import subprocess
 import sys
 import tempfile
 import wave
@@ -113,7 +115,7 @@ BAUD_TABLE = {
 
 
 # --------------------------------------------------------------------------
-# Hardware RC Bandpass Simulation (MSX CMTIN stage)
+# Optional (`--filter`) RC Bandpass Simulation (MSX CMTIN stage)
 # --------------------------------------------------------------------------
 
 
@@ -154,18 +156,419 @@ def apply_msx_hardware_filter(samples, framerate):
 
 
 # --------------------------------------------------------------------------
-# WAV reading
+# WAV, FLAC, etc. reading
 # --------------------------------------------------------------------------
 
 
+class PurePythonFlacDecoder:
+    """A low-performance pure Python FLAC decoder using memory buffering."""
+
+    def __init__(self, file_path):
+        with open(file_path, "rb") as f:
+            self.data = f.read()
+
+        self.data_len = len(self.data)
+        self.offset = 0
+
+        self.sample_rate = 44100
+        self.channels = 2
+        self.bits_per_sample = 16
+        self.total_samples = 0
+
+        # Bit stream buffer state
+        self.bit_buffer = 0
+        self.bit_count = 0
+
+        self.pcm_data = bytearray()
+        self._parse_flac()
+
+    def _read_bytes(self, n):
+        if self.offset + n > self.data_len:
+            return None
+        res = self.data[self.offset : self.offset + n]
+        self.offset += n
+        return res
+
+    def _parse_flac(self):
+        header = self._read_bytes(4)
+        if header != b"fLaC":
+            raise ValueError("Invalid FLAC file: Missing 'fLaC' signature marker.")
+
+        # Read metadata blocks
+        is_last = False
+        while not is_last:
+            block_header = self._read_bytes(4)
+            if not block_header or len(block_header) < 4:
+                break
+
+            is_last = (block_header[0] & 0x80) != 0
+            block_type = block_header[0] & 0x7F
+            block_length = struct.unpack(">I", b"\x00" + block_header[1:4])[0]
+            block_data = self._read_bytes(block_length)
+
+            if block_type == 0:  # STREAMINFO
+                self._parse_streaminfo(block_data)
+
+        # Read audio frames with compact carriage-return progress feedback
+        while self.offset < self.data_len:
+            percent = min(100.0, (self.offset / self.data_len) * 100.0)
+            sys.stdout.write(f"\rDecoding FLAC: {percent:5.1f}%")
+            sys.stdout.flush()
+
+            sync_marker = self._read_bytes(2)
+            if not sync_marker:
+                break
+
+            # Check for sync code (14 bits set to 1 -> 0xFFF)
+            if len(sync_marker) == 2 and (
+                sync_marker[0] == 0xFF
+                and (sync_marker[1 & 0xFE] == 0xF8 or (sync_marker[1] & 0xFC) == 0xF0)
+            ):
+                self.offset -= 2  # Rewind sync marker
+                self._parse_frame()
+            else:
+                self.offset -= 1  # Resync scan step
+
+        sys.stdout.write("\rDecoding FLAC: 100.0% - Complete!\n")
+        sys.stdout.flush()
+
+    def _parse_streaminfo(self, data):
+        if len(data) < 34:
+            return
+        sr_ch_bps_and_samples = data[10:26]
+        combined_val = struct.unpack(">I", sr_ch_bps_and_samples[:4])[0]
+
+        self.sample_rate = combined_val >> 12
+        self.channels = ((combined_val >> 9) & 0x07) + 1
+        self.bits_per_sample = ((combined_val >> 4) & 0x1F) + 1
+        self.total_samples = (
+            int.from_bytes(sr_ch_bps_and_samples[4:12], "big") & 0xFFFFFFFFF
+        )
+
+    def _parse_frame(self):
+        self.bit_count = 0
+        self.bit_buffer = 0
+
+        header_start = self._read_bytes(2)
+        if not header_start or len(header_start) < 2:
+            return
+
+        if not self._read_bytes(1):  # block strategy / numbering
+            return
+
+        bs_sr = self._read_bytes(1)
+        if not bs_sr:
+            return
+        block_size_type = (bs_sr[0] >> 4) & 0x0F
+
+        ch_bps = self._read_bytes(1)
+        if not ch_bps:
+            return
+        channel_assignment = (ch_bps[0] >> 4) & 0x0F
+
+        block_size = self._get_block_size(block_size_type)
+        if block_size is None:
+            return
+
+        self._read_bytes(1)  # Skip CRC-8 header byte
+
+        subframe_samples = []
+        for ch in range(self.channels):
+            sub_samples = self._parse_subframe(block_size)
+            subframe_samples.append(sub_samples)
+
+        # Apply Channel Decorrelation if stereo assignment matches
+        if self.channels == 2 and len(subframe_samples) == 2:
+            left = subframe_samples[0]
+            right = subframe_samples[1]
+            if channel_assignment == 8:  # Left/Side -> R = L - S
+                right = [l - s for l, s in zip(left, right)]
+            elif channel_assignment == 9:  # Side/Right -> L = R + S
+                left = [r + s for r, s in zip(right, left)]
+            elif channel_assignment == 10:  # Mid/Side -> L = M + S/2, R = M - S/2
+                new_left = []
+                new_right = []
+                for m, s in zip(left, right):
+                    res = s >> 1
+                    new_left.append(m + res - (s & 1 & (s < 0)))
+                    new_right.append(m - res)
+                left, right = new_left, new_right
+            subframe_samples = [left, right]
+
+        self.bit_count = 0
+        self.bit_buffer = 0
+
+        for i in range(block_size):
+            for ch in range(self.channels):
+                if i < len(subframe_samples[ch]):
+                    sample = subframe_samples[ch][i]
+
+                    if self.bits_per_sample > 16:
+                        sample >>= self.bits_per_sample - 16
+                    elif self.bits_per_sample < 16:
+                        sample <<= 16 - self.bits_per_sample
+
+                    sample = max(-32768, min(32767, sample))
+                    self.pcm_data.extend(struct.pack("<h", sample))
+
+    def _get_block_size(self, bs_type):
+        if bs_type == 1:
+            return 192
+        elif 2 <= bs_type <= 5:
+            return 576 << (bs_type - 2)
+        elif bs_type == 6:
+            b = self._read_bytes(1)
+            return (b[0] + 1) if b else None
+        elif bs_type == 7:
+            b = self._read_bytes(2)
+            return (struct.unpack(">H", b)[0] + 1) if b else None
+        elif 8 <= bs_type <= 15:
+            return 256 << (bs_type - 8)
+        return None
+
+    def _parse_subframe(self, block_size):
+        sub_header = self._read_bytes(1)
+        if not sub_header:
+            return [0] * block_size
+
+        byte_val = sub_header[0]
+        sub_type = (byte_val >> 1) & 0x3F
+
+        wasted_bits = 0
+        if (byte_val & 0x01) != 0:
+            wasted_bits = self._read_unary() + 1
+
+        samples = [0] * block_size
+
+        if sub_type == 0:
+            sample = self._read_signed_bits(self.bits_per_sample)
+            samples = [sample] * block_size
+        elif sub_type == 1:
+            for i in range(block_size):
+                samples[i] = self._read_signed_bits(self.bits_per_sample)
+        elif 8 <= sub_type <= 12:
+            order = sub_type - 8
+            for i in range(order):
+                samples[i] = self._read_signed_bits(self.bits_per_sample)
+            samples = self._parse_residual(block_size, order, samples)
+        elif 32 <= sub_type <= 63:
+            order = sub_type - 31
+            for i in range(order):
+                samples[i] = self._read_signed_bits(self.bits_per_sample)
+            self._read_bytes(4)
+            samples = self._parse_residual(block_size, order, samples)
+
+        if wasted_bits > 0:
+            samples = [s << wasted_bits for s in samples]
+
+        return samples
+
+    def _parse_residual(self, block_size, order, samples):
+        rice_header = self._read_bits(2)
+        if rice_header is None:
+            return samples
+
+        param_len = 4 if rice_header == 0 else 5
+        partition_order = self._read_bits(4)
+        num_partitions = 1 << partition_order
+        part_samples = block_size >> partition_order
+
+        for p in range(num_partitions):
+            param = self._read_bits(param_len)
+            if param is None:
+                break
+
+            escape = (1 << param_len) - 1
+            start_idx = order if p == 0 else 0
+            end_idx = part_samples
+
+            for i in range(start_idx, end_idx):
+                idx = p * part_samples + i
+                if idx >= block_size:
+                    break
+                val = self._read_rice_signed(param if param < escape else 0)
+                prev_val = samples[idx - 1] if idx > 0 else 0
+                samples[idx] = val + prev_val
+
+        return samples
+
+    def _read_bits(self, n):
+        if n == 0:
+            return 0
+        while self.bit_count < n:
+            if self.offset >= self.data_len:
+                return None
+            self.bit_buffer = (self.bit_buffer << 8) | self.data[self.offset]
+            self.offset += 1
+            self.bit_count += 8
+
+        self.bit_count -= n
+        return (self.bit_buffer >> self.bit_count) & ((1 << n) - 1)
+
+    def _read_signed_bits(self, n):
+        unsigned_val = self._read_bits(n)
+        if unsigned_val is None:
+            return 0
+        if unsigned_val & (1 << (n - 1)):
+            unsigned_val -= 1 << n
+        return unsigned_val
+
+    def _read_unary(self):
+        count = 0
+        while True:
+            bit = self._read_bits(1)
+            if bit is None or bit == 1:
+                break
+            count += 1
+        return count
+
+    def _read_rice_signed(self, param):
+        val = self._read_unary()
+        if param > 0:
+            low = self._read_bits(param)
+            if low is not None:
+                val = (val << param) | low
+        if val & 1:
+            return -((val >> 1) + 1)
+        else:
+            return val >> 1
+
+
+def open_flac_as_wav(file_path):
+    """Standalone helper function that accepts a FLAC file path and returns a standard wave.Wave_read object."""
+    decoder = PurePythonFlacDecoder(file_path)
+    pcm_bytes = bytes(decoder.pcm_data)
+    data_length = len(pcm_bytes)
+
+    wav_io = io.BytesIO()
+    riff_chunk_size = 36 + data_length
+    audio_format = 1  # PCM
+    channels = decoder.channels
+    sample_rate = decoder.sample_rate
+    bits_per_sample = 16  # Forced standard 16-bit downsampled layout
+    block_align = channels * (bits_per_sample // 8)
+    byte_rate = sample_rate * block_align
+
+    wav_io.write(b"RIFF")
+    wav_io.write(struct.pack("<I", riff_chunk_size))
+    wav_io.write(b"WAVE")
+
+    # fmt sub-chunk
+    wav_io.write(b"fmt ")
+    wav_io.write(struct.pack("<I", 16))
+    wav_io.write(struct.pack("<H", audio_format))
+    wav_io.write(struct.pack("<H", channels))
+    wav_io.write(struct.pack("<I", sample_rate))
+    wav_io.write(struct.pack("<I", byte_rate))
+    wav_io.write(struct.pack("<H", block_align))
+    wav_io.write(struct.pack("<H", bits_per_sample))
+
+    # data sub-chunk
+    wav_io.write(b"data")
+    wav_io.write(struct.pack("<I", data_length))
+    wav_io.write(pcm_bytes)
+
+    wav_io.seek(0)
+    return wave.open(wav_io, "rb")
+
+
+class DirectWavReader:
+    """A lightweight wrapper that mimics wave.Wave_read with context manager support and minimal memory bloat."""
+
+    def __init__(self, file_path, wave_obj):
+        self._file_path = file_path
+        self._wave_obj = wave_obj
+
+    def getnchannels(self):
+        return self._wave_obj.getnchannels()
+
+    def getsampwidth(self):
+        return self._wave_obj.getsampwidth()
+
+    def getframerate(self):
+        return self._wave_obj.getframerate()
+
+    def getnframes(self):
+        return self._wave_obj.getnframes()
+
+    def readframes(self, n):
+        return self._wave_obj.readframes(n)
+
+    def close(self):
+        try:
+            self._wave_obj.close()
+        finally:
+            # Clean up the temporary file from disk when closed
+            if os.path.exists(self._file_path):
+                os.remove(self._file_path)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+
+def open_via_ffmpeg_as_wav(file_path):
+    """
+    Decodes audio via FFmpeg straight to disk and returns a lightweight
+    context-manager compatible reader object.
+    """
+    temp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    temp_wav.close()  # Close handle so FFmpeg can write to it cleanly
+
+    cmd = [
+        "ffmpeg",
+        "-v",
+        "quiet",
+        "-i",
+        file_path,
+        "-acodec",
+        "pcm_s16le",
+        "-y",
+        temp_wav.name,
+    ]
+
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        if os.path.exists(temp_wav.name):
+            os.remove(temp_wav.name)
+        raise RuntimeError(
+            f"FFmpeg decoding failed: {result.stderr.decode('utf-8', errors='ignore')}"
+        )
+
+    wav_obj = wave.open(temp_wav.name, "rb")
+    return DirectWavReader(temp_wav.name, wav_obj)
+
+
+def open_wave_or_flac_for_reading(path):
+    try:
+        # should be fast when it works at all, and supports more
+        # formats
+        return open_via_ffmpeg_as_wav(path)
+    except:
+        pass
+    try:
+        # very slow but lets us use FLAC where we otherwise could not
+        return open_flac_as_wav(path)
+    except:
+        pass
+    # normal WAV-only path, limited to old "traditional" Windows WAV
+    # codec support (8bit unsigned/16bit signed PCM)
+    return wave.open(path, "rb")
+
+
 def read_wav_mono(path):
-    """Read a WAV file and return (samples, framerate).
+    """Read a WAV file and return (samples, framerate). FLAC also
+    works, possibly much more slowly. other formats may also work if
+    you have ffmpeg installed and available on your PATH.
 
     samples is a flat list of ints/floats, mono (channels averaged if the
     file is stereo/multi-channel), DC offset NOT removed (the edge detector
     below handles that implicitly via zero-crossing + hysteresis).
+
     """
-    with wave.open(path, "rb") as wf:
+    with open_wave_or_flac_for_reading(path) as wf:
         nchannels = wf.getnchannels()
         sampwidth = wf.getsampwidth()
         framerate = wf.getframerate()
