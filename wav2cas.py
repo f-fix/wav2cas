@@ -162,21 +162,26 @@ def apply_band_filter(samples, framerate):
     lp_rc = 1.0 / (2.0 * math.pi * 6000.0)
     lp_alpha = dt / (lp_rc + dt)
 
+    # Use a single output array and single pass to save memory and time
     filtered = array.array("f", [0.0]) * len(samples)
 
-    prev_in = samples[0]
-    prev_out = 0.0
-    hp_out = array.array("f", [0.0]) * len(samples)
+    prev_in = float(samples[0])
+    prev_hp_out = 0.0
+    prev_lp_val = 0.0
+
     for i in range(len(samples)):
         cur_in = float(samples[i])
-        prev_out = hp_alpha * (prev_out + cur_in - prev_in)
-        hp_out[i] = prev_out
+
+        # High-pass step
+        hp_out = hp_alpha * (prev_hp_out + cur_in - prev_in)
+        prev_hp_out = hp_out
         prev_in = cur_in
 
-    prev_val = hp_out[0]
-    for i in range(len(hp_out)):
-        prev_val = prev_val + lp_alpha * (hp_out[i] - prev_val)
-        filtered[i] = prev_val
+        # Low-pass step
+        lp_out = prev_lp_val + lp_alpha * (hp_out - prev_lp_val)
+        prev_lp_val = lp_out
+
+        filtered[i] = lp_out
 
     return filtered
 
@@ -248,7 +253,7 @@ class PurePythonFlacDecoder:
             # Check for sync code (14 bits set to 1 -> 0xFFF)
             if len(sync_marker) == 2 and (
                 sync_marker[0] == 0xFF
-                and (sync_marker[1 & 0xFE] == 0xF8 or (sync_marker[1] & 0xFC) == 0xF0)
+                and (sync_marker[1] & 0xFE == 0xF8 or (sync_marker[1] & 0xFC) == 0xF0)
             ):
                 self.offset -= 2  # Rewind sync marker
                 self._parse_frame()
@@ -702,7 +707,7 @@ def find_all_edges(
 
     Requires the signal to cross back past the opposite threshold before
     the next crossing is accepted, which gives noise immunity (a
-    bidirectional Schmitt trigger). Returns a list of (fractional,
+    bidirectional Schmitt trigger). Returns a generator of (fractional,
     linearly-interpolated) sample indices of each accepted zero-crossing,
     in chronological order regardless of direction.
 
@@ -721,8 +726,6 @@ def find_all_edges(
     """
     peak_file = max((abs(s) for s in samples), default=0) or 1
 
-    edges = []
-
     # DC bias tracker (slow moving average, defines the AC signal's center)
     bias = float(samples[0])
     bias_alpha = 0.002
@@ -730,50 +733,66 @@ def find_all_edges(
     floor = peak_file * agc_floor_ratio
     envelope = floor
 
-    prev_v_adj = samples[0] - bias
+    prev_v_adj = float(samples[0]) - bias
     # state: which side of the hysteresis band we're currently "armed" to
     # cross away from. Starts unarmed in both directions until the signal
     # settles onto one side.
     armed_high = True
     armed_low = True
 
-    for i in range(1, len(samples)):
-        cur = float(samples[i])
+    # Performance optimization: Localize loop variables
+    interp = _interp_zero
 
-        bias = bias * (1.0 - bias_alpha) + cur * bias_alpha
-        v_adj = cur - bias
+    if agc:
+        # Hot loop version with AGC
+        for i, sample in enumerate(samples):
+            cur = float(sample)
+            bias += (cur - bias) * bias_alpha
+            v_adj = cur - bias
 
-        if agc:
             abs_v = abs(v_adj)
             if abs_v > envelope:
-                envelope = envelope * (1.0 - agc_attack) + abs_v * agc_attack
+                envelope += (abs_v - envelope) * agc_attack
             else:
-                envelope = envelope * (1.0 - agc_release) + abs_v * agc_release
+                envelope += (abs_v - envelope) * agc_release
+
             if envelope < floor:
                 envelope = floor
+
             local_threshold = envelope * threshold_ratio
-        else:
-            local_threshold = peak_file * threshold_ratio
 
-        # Rising crossing of zero, only accepted once we've dipped below
-        # -threshold since the last rising crossing.
-        if armed_high and prev_v_adj < 0 <= v_adj:
-            edges.append(_interp_zero(i - 1, prev_v_adj, v_adj))
-            armed_high = False
-        # Falling crossing of zero, only accepted once we've risen above
-        # +threshold since the last falling crossing.
-        elif armed_low and prev_v_adj > 0 >= v_adj:
-            edges.append(_interp_zero(i - 1, prev_v_adj, v_adj))
-            armed_low = False
+            if armed_high and prev_v_adj < 0 <= v_adj:
+                yield interp(i - 1, prev_v_adj, v_adj)
+                armed_high = False
+            elif armed_low and prev_v_adj > 0 >= v_adj:
+                yield interp(i - 1, prev_v_adj, v_adj)
+                armed_low = False
 
-        if v_adj < -local_threshold:
-            armed_high = True
-        if v_adj > local_threshold:
-            armed_low = True
+            if v_adj < -local_threshold:
+                armed_high = True
+            if v_adj > local_threshold:
+                armed_low = True
+            prev_v_adj = v_adj
+    else:
+        # Hot loop version without AGC
+        local_threshold = peak_file * threshold_ratio
+        for i, sample in enumerate(samples):
+            cur = float(sample)
+            bias += (cur - bias) * bias_alpha
+            v_adj = cur - bias
 
-        prev_v_adj = v_adj
+            if armed_high and prev_v_adj < 0 <= v_adj:
+                yield interp(i - 1, prev_v_adj, v_adj)
+                armed_high = False
+            elif armed_low and prev_v_adj > 0 >= v_adj:
+                yield interp(i - 1, prev_v_adj, v_adj)
+                armed_low = False
 
-    return edges
+            if v_adj < -local_threshold:
+                armed_high = True
+            if v_adj > local_threshold:
+                armed_low = True
+            prev_v_adj = v_adj
 
 
 def _interp_zero(i0, v0, v1):
@@ -784,21 +803,21 @@ def _interp_zero(i0, v0, v1):
     return i0 + frac
 
 
-def edges_to_half_periods(edges):
-    """Convert consecutive zero-crossing positions into a list of
+def edges_to_half_periods(edges_gen):
+    """Convert consecutive zero-crossing positions into a generator of
     half-cycle lengths (in samples). Working in the sample-length domain
     rather than frequency makes the long/short midpoint classification
     used by decode() a simple comparison. Since find_all_edges detects
     every zero-crossing (not just rising ones), each entry here is one
     half-cycle: two of them make a full cycle.
     """
-    half_periods = []
-    for i in range(len(edges) - 1):
-        length = edges[i + 1] - edges[i]
-        if length <= 0:
-            continue
-        half_periods.append(length)
-    return half_periods
+    prev_edge = None
+    for edge in edges_gen:
+        if prev_edge is not None:
+            length = edge - prev_edge
+            if length > 0:
+                yield length
+        prev_edge = edge
 
 
 # --------------------------------------------------------------------------
@@ -1155,7 +1174,7 @@ def _test_decode_samples(
     samples, framerate=_TEST_FRAMERATE, threshold_ratio=0.2, agc=True, **decode_kwargs
 ):
     edges = find_all_edges(samples, threshold_ratio, agc=agc)
-    half_periods = edges_to_half_periods(edges)
+    half_periods = list(edges_to_half_periods(edges))
     return decode(half_periods, framerate, **decode_kwargs)
 
 
@@ -1639,7 +1658,8 @@ def main():
     if args.filter:
         samples = apply_band_filter(samples, framerate)
 
-    edges = find_all_edges(
+    # Use generators to chain the processing pipeline and save memory
+    edges_gen = find_all_edges(
         samples,
         args.threshold_ratio,
         agc=not args.no_agc,
@@ -1647,9 +1667,11 @@ def main():
         agc_release=args.agc_release,
         agc_floor_ratio=args.agc_floor_ratio,
     )
-    print("%d rising edges detected" % len(edges), file=sys.stderr)
+    half_periods_gen = edges_to_half_periods(edges_gen)
 
-    half_periods = edges_to_half_periods(edges)
+    # decode() requires random access/indexing, so we consume the generator here
+    half_periods = list(half_periods_gen)
+    print("%d half-cycles detected" % len(half_periods), file=sys.stderr)
 
     blocks = decode(
         half_periods,
