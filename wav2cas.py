@@ -104,6 +104,7 @@ LIMITATIONS:
 """
 
 import argparse
+import array
 import io
 import math
 import os
@@ -150,11 +151,11 @@ def apply_band_filter(samples, framerate):
     lp_rc = 1.0 / (2.0 * math.pi * 6000.0)
     lp_alpha = dt / (lp_rc + dt)
 
-    filtered = [0.0] * len(samples)
+    filtered = array.array("f", [0.0]) * len(samples)
 
     prev_in = samples[0]
     prev_out = 0.0
-    hp_out = [0.0] * len(samples)
+    hp_out = array.array("f", [0.0]) * len(samples)
     for i in range(len(samples)):
         cur_in = float(samples[i])
         prev_out = hp_alpha * (prev_out + cur_in - prev_in)
@@ -606,7 +607,7 @@ def read_wav_mono(path, allow_native_formats=True, stereo_to_mono="mix"):
         elif stereo_to_mono == "right":
             samples = samples[1::nchannels]
         else:
-            mono = []
+            mono = array.array("f")
             for i in range(0, len(samples) - nchannels + 1, nchannels):
                 frame = samples[i : i + nchannels]
                 mono.append(sum(frame) / nchannels)
@@ -615,26 +616,52 @@ def read_wav_mono(path, allow_native_formats=True, stereo_to_mono="mix"):
     return samples, framerate
 
 
+# Reinterpreting an unsigned byte (0..255) as signed-after-subtracting-128 is
+# the same as flipping its sign bit (XOR 0x80) and then reading it as signed
+# two's-complement - this lets the whole 8-bit case go through bytes.translate
+# (fast, in C) instead of a Python-level loop.
+_UNSIGNED8_TO_SIGNED8 = bytes(b ^ 0x80 for b in range(256))
+
+
 def _unpack_samples(raw, sampwidth):
+    """Unpack raw little-endian PCM bytes into an array.array of samples.
+
+    Returns a compact typed array (2-4 bytes/sample, no per-sample Python
+    object) rather than a list of boxed ints/floats - for a several-
+    hundred-megasample file that's the difference between tens of
+    megabytes and multiple gigabytes of memory. Everything downstream
+    (indexing, slicing, iteration, len()) works the same as it would on a
+    plain list.
+    """
     if sampwidth == 1:
         # WAV 8-bit PCM is unsigned, centered on 128
-        return [b - 128 for b in raw]
+        arr = array.array("b")
+        arr.frombytes(raw.translate(_UNSIGNED8_TO_SIGNED8))
+        return arr
     elif sampwidth == 2:
         count = len(raw) // 2
-        return list(struct.unpack("<%dh" % count, raw[: count * 2]))
+        arr = array.array("h")
+        arr.frombytes(raw[: count * 2])
+        if sys.byteorder != "little":
+            arr.byteswap()
+        return arr
     elif sampwidth == 3:
         count = len(raw) // 3
-        out = [0] * count
+        arr = array.array("i", bytes(4 * count))
         for i in range(count):
             b0, b1, b2 = raw[i * 3], raw[i * 3 + 1], raw[i * 3 + 2]
             v = b0 | (b1 << 8) | (b2 << 16)
             if v & 0x800000:
                 v -= 0x1000000
-            out[i] = v
-        return out
+            arr[i] = v
+        return arr
     elif sampwidth == 4:
         count = len(raw) // 4
-        return list(struct.unpack("<%di" % count, raw[: count * 4]))
+        arr = array.array("i")
+        arr.frombytes(raw[: count * 4])
+        if sys.byteorder != "little":
+            arr.byteswap()
+        return arr
     else:
         raise ValueError("Unsupported sample width: %d bytes" % sampwidth)
 
@@ -1366,7 +1393,7 @@ def _t_stereo_to_mono():
         return False, "left should be all +100: %r" % (left[:3],)
     if any(v != right_val for v in right):
         return False, "right should be all -100: %r" % (right[:3],)
-    if not (mono_mix == mono_left == mono_right == [42] * n):
+    if not (mono_mix.tolist() == mono_left.tolist() == mono_right.tolist() == [42] * n):
         return False, "stereo_to_mono must be ignored for mono input"
     return True, "ok"
 
