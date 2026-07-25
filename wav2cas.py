@@ -115,6 +115,17 @@ import sys
 import tempfile
 import wave
 
+# In a sandboxed environment `subprocess` might not be available. If
+# that's the case, comment out the `import subprocess` line above and
+# uncomment this mock:
+#
+# from types import ModuleType
+# sys.modules['subprocess'] = type('Mock', (ModuleType,), {
+#     '__getattr__': lambda s, n: (_ for _ in ()).throw(
+#         OSError(f"subprocess.{n} disabled")),
+# })('subprocess')
+
+
 CAS_HEADER = bytes([0x1F, 0xA6, 0xDE, 0xBA, 0xCC, 0x13, 0x7D, 0x74])
 
 # baud rate -> (bit-0 frequency, bit-1 frequency)
