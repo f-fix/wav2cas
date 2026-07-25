@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""wav2cas.py - Decode MSX cassette audio (WAV) into a .CAS file.
+"""wav2cas.py - Decode MSX and MSX-like cassette audio (WAV) into a .CAS file.
 
 Pure Python, standard library only (wave, struct, argparse, sys).
 
@@ -7,9 +7,12 @@ FORMAT ASSUMPTIONS (standard MSX BIOS cassette encoding, FSK / Kansas-City style
 
   * A "0" data bit is encoded as ONE cycle at the base frequency for the
     current baud rate.
+
   * A "1" data bit is encoded as TWO cycles at double the base frequency.
-  * Supported baud rates (auto-detected from the pilot tone frequency),
-    covering the range real MSX hardware and turbo-loaders use:
+
+  * Supported baud rates (auto-detected from the pilot tone
+    frequency), covering the range typical MSX tapes and FSK turbo-loaders
+    use, and also some adjacent systems:
 
         baud    bit-0 freq   bit-1 freq
          600     600 Hz       1200 Hz
@@ -26,15 +29,16 @@ FORMAT ASSUMPTIONS (standard MSX BIOS cassette encoding, FSK / Kansas-City style
     UART frames: 1 start bit (0), 8 data bits (LSB first), then a stop
     bit / mark period.
 
-  * STOP BITS: by default the decoder is strict, exactly like older tape
-    tools - after the 8 data bits it requires --stop-bits (default 2)
-    genuine "1" bits before accepting the byte, and drops the byte (and
-    resyncs on the pilot search) if that doesn't hold. This is what keeps
-    stray noise or pilot/data transition artifacts from being misread as
-    spurious extra bytes right before or after a real block. Pass
-    --lenient-stop-bits to fall back to the older, more permissive
-    behavior that just looks for the next start bit with no fixed count
-    (useful for tapes whose stop-bit timing is irregular).
+  * STOP BITS: by default the decoder is strict, exactly like older
+    tape tools - after the 8 data bits it requires --stop-bits
+    (default 2) genuine "1" bits before accepting the byte, and drops
+    the byte (and resyncs on the pilot search) if that doesn't
+    hold. This is what keeps stray noise or pilot/data transition
+    artifacts from being misread as spurious extra bytes right before
+    or after a real block. Pass --lenient-stop-bits to fall back to
+    more permissive behavior that just looks for the next start bit
+    with no fixed count (useful for tapes whose stop-bit timing is
+    irregular).
 
   * Bit classification uses a single adaptive midpoint threshold between
     the nominal "short" (bit-1) and "long" (bit-0) cycle lengths, rather
@@ -64,7 +68,7 @@ FORMAT ASSUMPTIONS (standard MSX BIOS cassette encoding, FSK / Kansas-City style
     confidences. Block confidence is printed as a diagnostic, and blocks
     scoring below --min-confidence (default 0.8) are
     left out of the output file - useful for automatically discarding
-    blocks decoded from a garbled/noisy stretch of tape.
+    spurious blocks decoded from a garbled/noisy stretch of tape.
 
   * Every time a new pilot tone run is detected after at least one byte has
     already been decoded, the previously accumulated bytes are flushed out
@@ -77,16 +81,26 @@ FORMAT ASSUMPTIONS (standard MSX BIOS cassette encoding, FSK / Kansas-City style
 
         1F A6 DE BA CC 13 7D 74
 
-    (this is the same convention used by real MSX emulators' .cas files -
-    it lets a loader locate block boundaries in the file since a raw .cas
-    does not otherwise store timing/pilot information).
+    (this is the same convention used by real MSX emulators' .cas
+    files - it lets a loader locate block boundaries in the file since
+    a raw .cas does not otherwise store timing/pilot
+    information. Essentially it represents "silence").
 
   * With --pad, 0-7 zero bytes are inserted before each CAS block header so
     it starts at a file offset that's a multiple of 8, which some MSX tools
     expect. Off by default.
 
 LIMITATIONS:
-  * Only handles integer PCM WAV data (8/16/24/32-bit), not floating point.
+
+  * Only handles integer PCM WAV data (8/16/24/32-bit), not floating
+    point or more obscure codecs. However, there is also support (on
+    by default) for converting all inputs to 16-bit signed linear PCM
+    using external `ffmpeg`. The `--no-native-formats` flag turns it
+    off. it will automatically fall back to a slow internal decoder
+    for FLAC inputs if `ffmpeg` doesn't work, but
+    `--no-native-formats` likewise turns this off and makes it
+    WAV-only.
+
 """
 
 import argparse
@@ -119,8 +133,8 @@ BAUD_TABLE = {
 # --------------------------------------------------------------------------
 
 
-def apply_msx_hardware_filter(samples, framerate):
-    """Simulates the MSX cassette hardware input circuit response.
+def apply_band_filter(samples, framerate):
+    """Crudely simulates cassette hardware input circuit response.
 
     Applies a DC-blocking high-pass filter (~300 Hz) and a gentle smoothing
     low-pass filter (~6 kHz) to clean up tape rumble and high-frequency hiss
@@ -571,10 +585,6 @@ def read_wav_mono(path, allow_native_formats=True):
     your own `ffmpeg` invocation) than have this tool shell out to ffmpeg
     on your behalf.
 
-    samples is a flat list of ints/floats, mono (channels averaged if the
-    file is stereo/multi-channel), DC offset NOT removed (the edge detector
-    below handles that implicitly via zero-crossing + hysteresis).
-
     """
     with open_wave_or_flac_for_reading(path, allow_native_formats) as wf:
         nchannels = wf.getnchannels()
@@ -635,14 +645,7 @@ def find_all_edges(
     """Schmitt-trigger zero-crossing detector, polarity-independent.
 
     Detects EVERY zero-crossing - both rising and falling - rather than
-    only rising ones. This is what real MSX cassette-reading hardware
-    actually does: the tape signal goes through a comparator and the CPU
-    just measures the time between successive edges in either direction
-    (a "half-cycle"), so it doesn't matter whether the tape (or a
-    recording of it) has been captured with inverted polarity - a
-    rising-edge-only detector, by contrast, can measure a different
-    (and on an asymmetric or DC-biased signal, sometimes less clean)
-    timing depending on which polarity it happens to see.
+    only rising ones. This ensures polarity-agnostic decoding.
 
     Requires the signal to cross back past the opposite threshold before
     the next crossing is accepted, which gives noise immunity (a
@@ -650,10 +653,10 @@ def find_all_edges(
     linearly-interpolated) sample indices of each accepted zero-crossing,
     in chronological order regardless of direction.
 
-    Real MSX hardware uses an AC-coupled input; this function mimics that
-    by tracking the local 'center' of the wave (a slow-moving bias
-    estimate) and subtracting it before thresholding, so recordings with
-    significant DC offset are handled the same as clean ones.
+    This function mimics an AC-coupled input by tracking the local
+    'center' of the wave (a slow-moving bias estimate) and subtracting
+    it before thresholding, so recordings with significant DC offset
+    are handled the same as clean ones.
 
     If agc is True, the threshold at each sample is threshold_ratio times
     a local amplitude envelope (fast attack / slow release, like an audio
@@ -661,6 +664,7 @@ def find_all_edges(
     whole file's peak amplitude, riding out gradual volume changes over a
     recording. A floor (agc_floor_ratio times the file's overall peak)
     keeps the envelope from collapsing during quiet/silent stretches.
+
     """
     peak_file = max((abs(s) for s in samples), default=0) or 1
 
@@ -719,11 +723,6 @@ def find_all_edges(
     return edges
 
 
-# kept as an alias: some callers/tests may still refer to the old name,
-# and "rising edges" was never really user-visible API
-find_rising_edges = find_all_edges
-
-
 def _interp_zero(i0, v0, v1):
     if v1 == v0:
         return float(i0)
@@ -732,7 +731,7 @@ def _interp_zero(i0, v0, v1):
     return i0 + frac
 
 
-def edges_to_periods(edges):
+def edges_to_half_periods(edges):
     """Convert consecutive zero-crossing positions into a list of
     half-cycle lengths (in samples). Working in the sample-length domain
     rather than frequency makes the long/short midpoint classification
@@ -740,13 +739,13 @@ def edges_to_periods(edges):
     every zero-crossing (not just rising ones), each entry here is one
     half-cycle: two of them make a full cycle.
     """
-    periods = []
+    half_periods = []
     for i in range(len(edges) - 1):
         length = edges[i + 1] - edges[i]
         if length <= 0:
             continue
-        periods.append(length)
-    return periods
+        half_periods.append(length)
+    return half_periods
 
 
 # --------------------------------------------------------------------------
@@ -782,7 +781,7 @@ def _trim_block_edges(data, confidences, threshold):
 
 
 def decode(
-    periods,
+    half_periods,
     framerate,
     tolerance=0.30,
     min_pilot_pulses=80,
@@ -796,12 +795,12 @@ def decode(
     max_gap_multiple=5.0,
     verbose=False,
 ):
-    """Decode a list of cycle-length ("period", in samples) values into a
+    """Decode a list of half cycle-length ("half-period", in samples) values into a
     list of (baud, bytes, confidence) blocks.
     """
     blocks = []
     i = 0
-    n = len(periods)
+    n = len(half_periods)
 
     state = "SEARCH"
     pilot_count = 0
@@ -853,18 +852,18 @@ def decode(
             threshold = (long_avg + short_avg) / 2
 
     def read_bit(idx):
-        """Read one encoded bit starting at periods[idx], where each
-        period is a half-cycle (see find_all_edges/edges_to_periods). A
+        """Read one encoded bit starting at half_periods[idx], where each
+        entry is a half-cycle (see find_all_edges/edges_to_half_periods). A
         "0" bit is one full cycle of the low tone = 2 long half-cycles; a
         "1" bit is two full cycles of the high tone = 4 short
         half-cycles. Returns (bit, next_idx, confidence); bit is None on
         failure/EOF."""
         if idx >= n:
             return None, idx, 0.0
-        c0 = classify(periods[idx])
+        c0 = classify(half_periods[idx])
         if c0 == "long":
-            if idx + 1 < n and classify(periods[idx + 1]) == "long":
-                p1, p2 = periods[idx], periods[idx + 1]
+            if idx + 1 < n and classify(half_periods[idx + 1]) == "long":
+                p1, p2 = half_periods[idx], half_periods[idx + 1]
                 conf = (pulse_confidence(p1) + pulse_confidence(p2)) / 2
                 update_long(p1)
                 update_long(p2)
@@ -872,9 +871,9 @@ def decode(
             return None, idx + 1, 0.0
         elif c0 == "short":
             if idx + 3 < n and all(
-                classify(periods[idx + k]) == "short" for k in (1, 2, 3)
+                classify(half_periods[idx + k]) == "short" for k in (1, 2, 3)
             ):
-                ps = periods[idx : idx + 4]
+                ps = half_periods[idx : idx + 4]
                 conf = sum(pulse_confidence(p) for p in ps) / 4
                 for p in ps:
                     update_short(p)
@@ -903,11 +902,16 @@ def decode(
             log("[block] entire block trimmed away as low-confidence noise")
             return
         block_conf = sum(confs) / len(confs)
+        if CAS_HEADER in data:
+            print(
+                "Warning: byte sequence matching CAS header found in data, this probably won't work",
+                file=sys.stderr,
+            )
         blocks.append((baud, data, block_conf))
         log("[block] %d bytes decoded, confidence=%.3f" % (len(data), block_conf))
 
     while i < n:
-        period = periods[i]
+        period = half_periods[i]
 
         if state == "SEARCH":
             freq = framerate / (2 * period) if period > 0 else 0
@@ -944,7 +948,7 @@ def decode(
                 ones_run += 1
                 i += 1
                 if ones_run >= min_pilot_pulses and not flushed_this_run:
-                    window = periods[max(0, i - min_pilot_pulses) : i]
+                    window = half_periods[max(0, i - min_pilot_pulses) : i]
                     avg_period = sum(window) / len(window)
                     freq = framerate / (2 * avg_period) if avg_period > 0 else 0
                     match = _best_baud_match(freq, tolerance)
@@ -1097,9 +1101,9 @@ def _test_gen_block(
 def _test_decode_samples(
     samples, framerate=_TEST_FRAMERATE, threshold_ratio=0.2, agc=True, **decode_kwargs
 ):
-    edges = find_rising_edges(samples, threshold_ratio, agc=agc)
-    periods = edges_to_periods(edges)
-    return decode(periods, framerate, **decode_kwargs)
+    edges = find_all_edges(samples, threshold_ratio, agc=agc)
+    half_periods = edges_to_half_periods(edges)
+    return decode(half_periods, framerate, **decode_kwargs)
 
 
 def _t_basic_multiblock():
@@ -1288,9 +1292,7 @@ def _t_edge_trim_untouched_interior():
 
 
 def _t_polarity_invariance():
-    # A polarity-inverted capture must decode identically to the original -
-    # real MSX cassette hardware reads based on half-cycle timing and does
-    # not care which way around the signal is wired/recorded.
+    # A polarity-inverted capture must decode identically to the original
     rng = random.Random(7)
     samples = []
     _test_gen_block(
@@ -1394,7 +1396,7 @@ def run_self_tests():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Decode MSX cassette audio (WAV) into a .CAS file."
+        description="Decode MSX or MSX-like cassette audio (WAV) into a .CAS file."
     )
     parser.add_argument("input", nargs="?", help="input .wav file")
     parser.add_argument("output", nargs="?", help="output .cas file")
@@ -1502,7 +1504,7 @@ def main():
     parser.add_argument(
         "--filter",
         action="store_true",
-        help="Apply built-in MSX hardware filter model for robust compatibility across tapes",
+        help="Apply built-in noise filter for noisy tapes",
     )
     parser.add_argument(
         "--pad",
@@ -1532,9 +1534,9 @@ def main():
     print("%d samples at %d Hz" % (len(samples), framerate), file=sys.stderr)
 
     if args.filter:
-        samples = apply_msx_hardware_filter(samples, framerate)
+        samples = apply_band_filter(samples, framerate)
 
-    edges = find_rising_edges(
+    edges = find_all_edges(
         samples,
         args.threshold_ratio,
         agc=not args.no_agc,
@@ -1544,10 +1546,10 @@ def main():
     )
     print("%d rising edges detected" % len(edges), file=sys.stderr)
 
-    periods = edges_to_periods(edges)
+    half_periods = edges_to_half_periods(edges)
 
     blocks = decode(
-        periods,
+        half_periods,
         framerate,
         tolerance=args.tolerance,
         min_pilot_pulses=args.min_pilot_pulses,
