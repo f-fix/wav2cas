@@ -1,7 +1,7 @@
 # wav2cas
 decode MSX and MSX-like cassette audio from WAV files into CAS format
 
-Pure Python, standard library only.
+Pure Python, standard library only. Inputs are converted to 16-bit signed PCM WAV first using external `ffmpeg` if you have it; you can turn that feature off using `--no-native-formats`. There is also a fallback pure-python FLAC-to-WAV converter for execution environments without `ffmpeg` but it's quite slow, and likewise will be turned off by `--no-native-formats`.
 
 ## Usage
 
