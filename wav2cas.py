@@ -573,7 +573,7 @@ def open_wave_or_flac_for_reading(path, allow_native_formats=True):
     return wave.open(path, "rb")
 
 
-def read_wav_mono(path, allow_native_formats=True):
+def read_wav_mono(path, allow_native_formats=True, stereo_to_mono="mix"):
     """Read a WAV file and return (samples, framerate). FLAC also
     works, possibly much more slowly. other formats may also work if
     you have ffmpeg installed and available on your PATH.
@@ -584,6 +584,11 @@ def read_wav_mono(path, allow_native_formats=True):
     rather convert non-WAV sources to WAV yourself ahead of time (e.g. via
     your own `ffmpeg` invocation) than have this tool shell out to ffmpeg
     on your behalf.
+
+    stereo_to_mono controls how a multi-channel file is collapsed to
+    mono: "mix" (default) averages all channels together, "left" uses
+    only the first channel, "right" uses only the second channel. Ignored
+    entirely for mono input.
 
     """
     with open_wave_or_flac_for_reading(path, allow_native_formats) as wf:
@@ -596,11 +601,16 @@ def read_wav_mono(path, allow_native_formats=True):
     samples = _unpack_samples(raw, sampwidth)
 
     if nchannels > 1:
-        mono = []
-        for i in range(0, len(samples) - nchannels + 1, nchannels):
-            frame = samples[i : i + nchannels]
-            mono.append(sum(frame) / nchannels)
-        samples = mono
+        if stereo_to_mono == "left":
+            samples = samples[0::nchannels]
+        elif stereo_to_mono == "right":
+            samples = samples[1::nchannels]
+        else:
+            mono = []
+            for i in range(0, len(samples) - nchannels + 1, nchannels):
+                frame = samples[i : i + nchannels]
+                mono.append(sum(frame) / nchannels)
+            samples = mono
 
     return samples, framerate
 
@@ -1321,6 +1331,46 @@ def _t_polarity_invariance():
     return True, "ok"
 
 
+def _t_stereo_to_mono():
+    left_val, right_val = 100, -100
+    n = 200
+    interleaved = []
+    for _ in range(n):
+        interleaved += [left_val, right_val]
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "stereo.wav")
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(2)
+            wf.setsampwidth(2)
+            wf.setframerate(44100)
+            wf.writeframes(struct.pack("<%dh" % len(interleaved), *interleaved))
+
+        mix, _ = read_wav_mono(path, stereo_to_mono="mix")
+        left, _ = read_wav_mono(path, stereo_to_mono="left")
+        right, _ = read_wav_mono(path, stereo_to_mono="right")
+
+        mono_path = os.path.join(d, "mono.wav")
+        with wave.open(mono_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(44100)
+            wf.writeframes(struct.pack("<%dh" % n, *([42] * n)))
+        mono_mix, _ = read_wav_mono(mono_path, stereo_to_mono="mix")
+        mono_left, _ = read_wav_mono(mono_path, stereo_to_mono="left")
+        mono_right, _ = read_wav_mono(mono_path, stereo_to_mono="right")
+
+    if any(v != 0 for v in mix):
+        return False, "mix should average +100/-100 to 0: %r" % (mix[:3],)
+    if any(v != left_val for v in left):
+        return False, "left should be all +100: %r" % (left[:3],)
+    if any(v != right_val for v in right):
+        return False, "right should be all -100: %r" % (right[:3],)
+    if not (mono_mix == mono_left == mono_right == [42] * n):
+        return False, "stereo_to_mono must be ignored for mono input"
+    return True, "ok"
+
+
 def _t_pad_alignment():
     blocks = [(1200, b"ABC", 1.0), (1200, b"HELLO", 1.0)]
     with tempfile.TemporaryDirectory() as d:
@@ -1362,6 +1412,7 @@ _SELF_TESTS = [
     ("edge trim: all low confidence", _t_edge_trim_all_low_confidence),
     ("edge trim: interior untouched", _t_edge_trim_untouched_interior),
     ("polarity invariance", _t_polarity_invariance),
+    ("stereo-to-mono channel selection", _t_stereo_to_mono),
     ("CAS --pad alignment", _t_pad_alignment),
 ]
 
@@ -1502,6 +1553,13 @@ def main():
         "convert a non-WAV source to WAV yourself first (e.g. with your own ffmpeg command)",
     )
     parser.add_argument(
+        "--stereo-to-mono",
+        choices=("mix", "left", "right"),
+        default="mix",
+        help="how to collapse a multi-channel input to mono: average all channels together "
+        "(default: mix), or use only the left or right channel. Ignored for mono input",
+    )
+    parser.add_argument(
         "--filter",
         action="store_true",
         help="Apply built-in noise filter for noisy tapes",
@@ -1529,7 +1587,9 @@ def main():
 
     print("Reading %s ..." % args.input, file=sys.stderr)
     samples, framerate = read_wav_mono(
-        args.input, allow_native_formats=not args.no_native_formats
+        args.input,
+        allow_native_formats=not args.no_native_formats,
+        stereo_to_mono=args.stereo_to_mono,
     )
     print("%d samples at %d Hz" % (len(samples), framerate), file=sys.stderr)
 
