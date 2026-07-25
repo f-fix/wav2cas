@@ -559,8 +559,13 @@ def open_via_ffmpeg_as_wav(file_path):
 def open_wave_or_flac_for_reading(path, allow_native_formats=True):
     if allow_native_formats:
         try:
-            # should be fast when it works at all, and supports more
-            # formats
+            # should be fast when it works at all
+            return wave.open(path, "rb")
+        except Exception:
+            pass
+        try:
+            # should be relatively fast when it works at all, and
+            # supports more formats
             return open_via_ffmpeg_as_wav(path)
         except Exception:
             pass
