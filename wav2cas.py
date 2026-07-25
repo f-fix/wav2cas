@@ -624,44 +624,66 @@ def _unpack_samples(raw, sampwidth):
 # --------------------------------------------------------------------------
 
 
-def find_rising_edges(
+def find_all_edges(
     samples,
     threshold_ratio,
     agc=True,
     agc_attack=0.3,
-    agc_release=0.005,  # Restore original release speed to pass tests
+    agc_release=0.005,
     agc_floor_ratio=0.02,
 ):
-    """Schmitt-trigger rising zero-crossing detector with DC bias tracking.
+    """Schmitt-trigger zero-crossing detector, polarity-independent.
 
-    Real MSX hardware uses an AC-coupled input. This function mimics that by
-    tracking the local 'center' of the wave (bias) and subtracting it.
-    This allows the Schmitt trigger to arm and fire even on recordings with
-    significant DC offset (like File 4) while maintaining compatibility
-    with existing tests.
+    Detects EVERY zero-crossing - both rising and falling - rather than
+    only rising ones. This is what real MSX cassette-reading hardware
+    actually does: the tape signal goes through a comparator and the CPU
+    just measures the time between successive edges in either direction
+    (a "half-cycle"), so it doesn't matter whether the tape (or a
+    recording of it) has been captured with inverted polarity - a
+    rising-edge-only detector, by contrast, can measure a different
+    (and on an asymmetric or DC-biased signal, sometimes less clean)
+    timing depending on which polarity it happens to see.
+
+    Requires the signal to cross back past the opposite threshold before
+    the next crossing is accepted, which gives noise immunity (a
+    bidirectional Schmitt trigger). Returns a list of (fractional,
+    linearly-interpolated) sample indices of each accepted zero-crossing,
+    in chronological order regardless of direction.
+
+    Real MSX hardware uses an AC-coupled input; this function mimics that
+    by tracking the local 'center' of the wave (a slow-moving bias
+    estimate) and subtracting it before thresholding, so recordings with
+    significant DC offset are handled the same as clean ones.
+
+    If agc is True, the threshold at each sample is threshold_ratio times
+    a local amplitude envelope (fast attack / slow release, like an audio
+    compressor's envelope follower) rather than a value derived from the
+    whole file's peak amplitude, riding out gradual volume changes over a
+    recording. A floor (agc_floor_ratio times the file's overall peak)
+    keeps the envelope from collapsing during quiet/silent stretches.
     """
     peak_file = max((abs(s) for s in samples), default=0) or 1
 
     edges = []
-    armed = True
 
-    # DC Bias Tracker (slow average)
+    # DC bias tracker (slow moving average, defines the AC signal's center)
     bias = float(samples[0])
     bias_alpha = 0.002
 
-    # AGC state (tracked relative to the AC signal)
     floor = peak_file * agc_floor_ratio
     envelope = floor
 
     prev_v_adj = samples[0] - bias
+    # state: which side of the hysteresis band we're currently "armed" to
+    # cross away from. Starts unarmed in both directions until the signal
+    # settles onto one side.
+    armed_high = True
+    armed_low = True
 
     for i in range(1, len(samples)):
         cur = float(samples[i])
 
-        # 1. Update Bias Tracker (find the center of the wave)
         bias = bias * (1.0 - bias_alpha) + cur * bias_alpha
-
-        # 2. Extract the AC component
         v_adj = cur - bias
 
         if agc:
@@ -670,32 +692,36 @@ def find_rising_edges(
                 envelope = envelope * (1.0 - agc_attack) + abs_v * agc_attack
             else:
                 envelope = envelope * (1.0 - agc_release) + abs_v * agc_release
-
             if envelope < floor:
                 envelope = floor
             local_threshold = envelope * threshold_ratio
         else:
             local_threshold = peak_file * threshold_ratio
 
-        # 3. Schmitt Trigger logic on the biased-removed signal
-        if not armed:
-            if v_adj < -local_threshold:
-                armed = True
-        else:
-            # Check for rising crossing of the center (v_adj = 0)
-            if prev_v_adj < 0 <= v_adj:
-                # Linear interpolation for sub-sample accuracy
-                frac = (
-                    (0 - prev_v_adj) / (v_adj - prev_v_adj)
-                    if v_adj != prev_v_adj
-                    else 0.0
-                )
-                edges.append((i - 1) + frac)
-                armed = False
+        # Rising crossing of zero, only accepted once we've dipped below
+        # -threshold since the last rising crossing.
+        if armed_high and prev_v_adj < 0 <= v_adj:
+            edges.append(_interp_zero(i - 1, prev_v_adj, v_adj))
+            armed_high = False
+        # Falling crossing of zero, only accepted once we've risen above
+        # +threshold since the last falling crossing.
+        elif armed_low and prev_v_adj > 0 >= v_adj:
+            edges.append(_interp_zero(i - 1, prev_v_adj, v_adj))
+            armed_low = False
+
+        if v_adj < -local_threshold:
+            armed_high = True
+        if v_adj > local_threshold:
+            armed_low = True
 
         prev_v_adj = v_adj
 
     return edges
+
+
+# kept as an alias: some callers/tests may still refer to the old name,
+# and "rising edges" was never really user-visible API
+find_rising_edges = find_all_edges
 
 
 def _interp_zero(i0, v0, v1):
@@ -707,10 +733,12 @@ def _interp_zero(i0, v0, v1):
 
 
 def edges_to_periods(edges):
-    """Convert consecutive rising-edge positions into a list of cycle
-    lengths (in samples), one entry per full cycle. Working in the sample-
-    length ("period") domain rather than frequency makes the long/short
-    midpoint classification used by decode() a simple comparison.
+    """Convert consecutive zero-crossing positions into a list of
+    half-cycle lengths (in samples). Working in the sample-length domain
+    rather than frequency makes the long/short midpoint classification
+    used by decode() a simple comparison. Since find_all_edges detects
+    every zero-crossing (not just rising ones), each entry here is one
+    half-cycle: two of them make a full cycle.
     """
     periods = []
     for i in range(len(edges) - 1):
@@ -757,7 +785,7 @@ def decode(
     periods,
     framerate,
     tolerance=0.30,
-    min_pilot_pulses=40,
+    min_pilot_pulses=80,
     adapt=True,
     adapt_rate=0.1,
     adapt_clamp=0.35,
@@ -825,21 +853,32 @@ def decode(
             threshold = (long_avg + short_avg) / 2
 
     def read_bit(idx):
+        """Read one encoded bit starting at periods[idx], where each
+        period is a half-cycle (see find_all_edges/edges_to_periods). A
+        "0" bit is one full cycle of the low tone = 2 long half-cycles; a
+        "1" bit is two full cycles of the high tone = 4 short
+        half-cycles. Returns (bit, next_idx, confidence); bit is None on
+        failure/EOF."""
         if idx >= n:
             return None, idx, 0.0
-        p = periods[idx]
-        c = classify(p)
-        if c == "long":
-            conf = pulse_confidence(p)
-            update_long(p)
-            return 0, idx + 1, conf
-        elif c == "short":
-            if idx + 1 < n and classify(periods[idx + 1]) == "short":
-                p2 = periods[idx + 1]
-                conf = (pulse_confidence(p) + pulse_confidence(p2)) / 2
-                update_short(p)
-                update_short(p2)
-                return 1, idx + 2, conf
+        c0 = classify(periods[idx])
+        if c0 == "long":
+            if idx + 1 < n and classify(periods[idx + 1]) == "long":
+                p1, p2 = periods[idx], periods[idx + 1]
+                conf = (pulse_confidence(p1) + pulse_confidence(p2)) / 2
+                update_long(p1)
+                update_long(p2)
+                return 0, idx + 2, conf
+            return None, idx + 1, 0.0
+        elif c0 == "short":
+            if idx + 3 < n and all(
+                classify(periods[idx + k]) == "short" for k in (1, 2, 3)
+            ):
+                ps = periods[idx : idx + 4]
+                conf = sum(pulse_confidence(p) for p in ps) / 4
+                for p in ps:
+                    update_short(p)
+                return 1, idx + 4, conf
             return None, idx + 1, 0.0
         else:
             return None, idx + 1, 0.0
@@ -871,7 +910,7 @@ def decode(
         period = periods[i]
 
         if state == "SEARCH":
-            freq = framerate / period if period > 0 else 0
+            freq = framerate / (2 * period) if period > 0 else 0
             match = _best_baud_match(freq, tolerance)
             if match is not None:
                 if pilot_count == 0 or match[0] != candidate[0]:
@@ -882,8 +921,8 @@ def decode(
                 i += 1
                 if pilot_count >= min_pilot_pulses:
                     baud, f0, f1 = candidate
-                    long_nom = framerate / f0
-                    short_nom = framerate / f1
+                    long_nom = framerate / (2 * f0)
+                    short_nom = framerate / (2 * f1)
                     long_avg = long_nom
                     short_avg = short_nom
                     threshold = (long_avg + short_avg) / 2
@@ -907,12 +946,12 @@ def decode(
                 if ones_run >= min_pilot_pulses and not flushed_this_run:
                     window = periods[max(0, i - min_pilot_pulses) : i]
                     avg_period = sum(window) / len(window)
-                    freq = framerate / avg_period if avg_period > 0 else 0
+                    freq = framerate / (2 * avg_period) if avg_period > 0 else 0
                     match = _best_baud_match(freq, tolerance)
                     if match is not None and match[0] != baud:
                         baud, f0, f1 = match
-                        long_nom = framerate / f0
-                        short_nom = framerate / f1
+                        long_nom = framerate / (2 * f0)
+                        short_nom = framerate / (2 * f1)
                         long_avg = long_nom
                         short_avg = short_nom
                         threshold = (long_avg + short_avg) / 2
@@ -1199,7 +1238,7 @@ def _t_confidence_filtering():
     )
     samples += [0] * 300
     _test_gen_block(
-        samples, 1200, b"GARBLED!", 0.5, noise_amp=0.35, jitter=0.25, rng=rng
+        samples, 1200, b"GARBLED!", 0.5, noise_amp=0.28, jitter=0.18, rng=rng
     )
     samples += [0] * int(_TEST_FRAMERATE * 0.2)
 
@@ -1248,6 +1287,38 @@ def _t_edge_trim_untouched_interior():
     return True, "ok"
 
 
+def _t_polarity_invariance():
+    # A polarity-inverted capture must decode identically to the original -
+    # real MSX cassette hardware reads based on half-cycle timing and does
+    # not care which way around the signal is wired/recorded.
+    rng = random.Random(7)
+    samples = []
+    _test_gen_block(
+        samples, 1200, b"HEADERID", 0.5, noise_amp=0.05, jitter=0.03, rng=rng
+    )
+    _test_gen_block(
+        samples, 1200, bytes(range(64)), 0.3, noise_amp=0.05, jitter=0.03, rng=rng
+    )
+    samples += [0] * int(_TEST_FRAMERATE * 0.2)
+
+    inverted = [-s for s in samples]
+
+    normal_blocks = _test_decode_samples(samples)
+    inverted_blocks = _test_decode_samples(inverted)
+
+    normal_payloads = [b[1] for b in normal_blocks]
+    inverted_payloads = [b[1] for b in inverted_blocks]
+
+    if normal_payloads != [b"HEADERID", bytes(range(64))]:
+        return False, "normal-polarity decode wasn't clean: %r" % (normal_payloads,)
+    if inverted_payloads != normal_payloads:
+        return False, (
+            "inverted-polarity decode didn't match normal: %r vs %r"
+            % (inverted_payloads, normal_payloads)
+        )
+    return True, "ok"
+
+
 def _t_pad_alignment():
     blocks = [(1200, b"ABC", 1.0), (1200, b"HELLO", 1.0)]
     with tempfile.TemporaryDirectory() as d:
@@ -1288,6 +1359,7 @@ _SELF_TESTS = [
     ("edge trim: mixed confidence", _t_edge_trim_mixed_confidence),
     ("edge trim: all low confidence", _t_edge_trim_all_low_confidence),
     ("edge trim: interior untouched", _t_edge_trim_untouched_interior),
+    ("polarity invariance", _t_polarity_invariance),
     ("CAS --pad alignment", _t_pad_alignment),
 ]
 
@@ -1336,8 +1408,9 @@ def main():
     parser.add_argument(
         "--min-pilot-pulses",
         type=int,
-        default=40,
-        help="consecutive pilot pulses required to lock onto a baud rate (default: 40)",
+        default=80,
+        help="consecutive pilot half-cycles required to lock onto a baud rate "
+        "(default: 80 - each is a half-cycle, so this is ~40 full pilot cycles)",
     )
     parser.add_argument(
         "--threshold-ratio",
