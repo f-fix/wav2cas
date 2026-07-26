@@ -443,9 +443,18 @@ class PurePythonFlacDecoder:
             for i in range(order):
                 samples[i] = self._read_signed_bits(self.bits_per_sample)
 
-            # Properly read LPC header: precision (4 bits), shift (5 bits signed), and coefficients
+            # LPC header: precision (4 bits), shift (5 bits, UNSIGNED per the
+            # FLAC spec - reading this as signed was the bug: any real shift
+            # value of 16-31 has its top bit set and would get misread as a
+            # small negative number, which then flipped "pred >> shift"
+            # (divide) into "pred << -shift" (multiply) below. Since this is
+            # a *recursive* predictor (each sample depends on previous
+            # predicted samples), multiplying instead of dividing at every
+            # step causes the values - and the cost of doing arbitrary-
+            # precision Python arithmetic on them - to blow up exponentially
+            # within a single subframe.
             prec = self._read_bits(4) + 1
-            shift = self._read_signed_bits(5)
+            shift = self._read_bits(5)
             coeffs = [self._read_signed_bits(prec) for _ in range(order)]
 
             samples = self._parse_residual(block_size, order, samples)
@@ -453,10 +462,7 @@ class PurePythonFlacDecoder:
             # Apply LPC predictors
             for i in range(order, block_size):
                 pred = sum(coeffs[j] * samples[i - 1 - j] for j in range(order))
-                if shift >= 0:
-                    samples[i] += pred >> shift
-                else:
-                    samples[i] += pred << (-shift)
+                samples[i] += pred >> shift
 
         if wasted_bits > 0:
             samples = [s << wasted_bits for s in samples]
@@ -574,16 +580,24 @@ class FlacStreamReader:
         return self.decoder.total_samples
 
     def readframes(self, n):
-        # Wave module expects bytes. We yield samples from generator and pack them.
-        samples = []
+        # Build a compact typed array (2 bytes/sample) instead of a list of
+        # boxed Python ints (~28-36 bytes each) - for a file with tens of
+        # millions of samples that's the difference between tens of
+        # megabytes and well over a gigabyte. array.tobytes() is also a
+        # single bulk C-level call, unlike struct.pack(f"...h", *samples)
+        # which would otherwise have to build a giant unpacked argument
+        # tuple first.
+        arr = array.array("h")
         for _ in range(n * self.decoder.channels):
             try:
-                samples.append(next(self.sample_gen))
+                arr.append(next(self.sample_gen))
             except StopIteration:
                 break
-        if not samples:
+        if not arr:
             return b""
-        return struct.pack(f"<{len(samples)}h", *samples)
+        if sys.byteorder != "little":
+            arr.byteswap()
+        return arr.tobytes()
 
     def close(self):
         self.decoder.close()
