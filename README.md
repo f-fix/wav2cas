@@ -1,9 +1,13 @@
-# wav2cas
+# wav2cas, cas2wav, flac2wav
+
+decode MSX and MSX-like cassette audio from WAV/FLAC files into CAS format; also encode CAS to WAV; also decode FLAC to WAV
+
+## wav2cas
 decode MSX and MSX-like cassette audio from WAV files into CAS format
 
 Pure Python, standard library only. Inputs are converted to 16-bit signed PCM WAV first using external `ffmpeg` if you have it; you can turn that feature off using `--no-native-formats`. There is also a fallback pure-python FLAC-to-WAV converter for execution environments without `ffmpeg` but it's quite slow, and likewise will be turned off by `--no-native-formats`.
 
-## Usage
+### Usage
 
 ```bash
 python3 wav2cas.py [--filter] input.wav output.cas [options]
@@ -16,7 +20,7 @@ trimming, and CAS block padding are all configurable).
 
 You can run it using `pypy3` for a noticeable speed improvement.
 
-## Self-tests
+### Self-tests
 
 ```
 python3 wav2cas.py --test
@@ -26,7 +30,7 @@ Runs the built-in regression suite (synthetic audio generated in memory or as te
 pre-existing external test files needed) and exits non-zero on failure. Run this after making any
 changes to the decoder.
 
-## Output of `--help`
+### Output of `--help`
 
 `````
 usage: wav2cas.py [-h] [--tolerance TOLERANCE]
@@ -106,14 +110,41 @@ options:
   -v, --verbose         print decoding progress to stderr
 `````
 
-# cas2wav
+## cas2wav
 
 Converts MSX CAS to WAV. Generates 22050 Hz monaural 16-bit signed linear PCM with 1200 baud FSK.
 
-## Usage
+### Usage
 
 ```bash
 python cas2wav.py input.cas output.wav
+```
+
+## flac2wav
+
+Decodes FLAC to WAV in pure Python. It's no speed demon, but it's fast enough to use.
+
+### Usage
+
+```
+flac2wav.py [-h] [--test] [input] [output]
+```
+Input and output files are required unless --test is specified.
+
+### Output of `--help`
+
+```
+usage: flac2wav.py [-h] [--test] [input] [output]
+
+Convert FLAC to WAV using a pure Python implementation.
+
+positional arguments:
+  input       Input .flac file
+  output      Output .wav file
+
+options:
+  -h, --help  show this help message and exit
+  --test      Run the internal verification test
 ```
 
 # Note on the code and the tools used to write it
