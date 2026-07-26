@@ -22,8 +22,8 @@ You can run it using `pypy3` for a noticeable speed improvement.
 python3 wav2cas.py --test
 ```
 
-Runs the built-in regression suite (synthetic audio generated in memory, no
-files needed) and exits non-zero on failure. Run this after making any
+Runs the built-in regression suite (synthetic audio generated in memory or as temporary files, no
+pre-existing external test files needed) and exits non-zero on failure. Run this after making any
 changes to the decoder.
 
 ## Output of `--help`
