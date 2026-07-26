@@ -106,6 +106,8 @@ LIMITATIONS:
 
 import argparse
 import array
+import base64
+import gzip
 import io
 import math
 import os
@@ -1557,6 +1559,176 @@ def _t_pad_alignment():
     return True, "ok"
 
 
+def _t_wav_decoding():
+    # this WAV was generated and encoded by:
+    # ```bash
+    # LC_ALL=C printf '\x1f\xa6\xde\xba\xcc\x13\x7d\x74%s' TEST > test.cas &&
+    #     python3 cas2wav.py test.cas test.wav &&
+    #     gzip -9 < test.wav | recode l1..l1/b64
+    # ```
+    wav = gzip.decompress(
+        base64.b64decode(
+            "H4sIAO6xZWoCA+3UvQnCUBSA0as4gBMEcYuAjaCChY2FWtgIIqSwc5e3QMDGKpUDSKawySYmO1gY"
+            "OV+6cx/JC/nZrler92AU+/luebneJuOIGLTHdBexeEQMYxzn0+30bNdEpHx2SJsyOzZF9boXNSGE"
+            "EEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBC"
+            "CCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQggh"
+            "hBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQ"
+            "QgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEII"
+            "IYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGE"
+            "EEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBC"
+            "CCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQggh"
+            "hBBCCCGEEEIIIYQQQgghhJB+SpmlPG1mh85TXmYR7azupu28Kupj870139pPH8/zr/fex3ejj9fy"
+            "XfhH/cKzkCRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJ"
+            "kiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJ"
+            "kiRJkiRJkiRJkiRJkiRJkiRJkiT9cx9DHaLo5AEEAA=="
+        )
+    )
+    with tempfile.NamedTemporaryFile(delete=True) as temp_file:
+        temp_file.write(wav)
+        temp_file.flush()
+        with wave.open(temp_file.name, "rb") as wf:
+            nchannels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            framerate = wf.getframerate()
+            nframes = wf.getnframes()
+            raw = wf.readframes(nframes)
+            if nchannels != 1:
+                return False, "channel count should be 1 but was %r" % nchannels
+            if sampwidth != 2:
+                return (
+                    False,
+                    "sample width should be 2 bytes but was %r bytes" % sampwidth,
+                )
+            if framerate != 22050:
+                return False, "frame rate should be 22050 but was %r" % framerate
+            if nframes != 131292:
+                return False, "frame count should be 131292 but was %r" % nframes
+            if len(raw) != sampwidth * nchannels * nframes:
+                return False, "raw sample data had the wrong length"
+            samples = _unpack_samples(raw, sampwidth)
+            edges_gen = find_all_edges(samples, 0.2)
+            half_periods_gen = edges_to_half_periods(edges_gen)
+            half_periods = list(half_periods_gen)
+            blocks = decode(half_periods, framerate)
+            if len(blocks) != 1:
+                return (
+                    False,
+                    "got wrong number of blocks: should be 1, instead %r" % len(blocks),
+                )
+            if blocks[0][0] != 1200:
+                return (
+                    False,
+                    "got wrong baud rate for block 0: should be 1200, instead %r"
+                    % blocks[0][0],
+                )
+            if blocks[0][1] != b"TEST":
+                return False, "got wrong data for block 0: should be %r, instead %r" % (
+                    b"TEST",
+                    blocks[0][1],
+                )
+            if blocks[0][2] < 0.9:
+                return (
+                    False,
+                    "too little confidence for block 0: should be at least 0.9, instead %r"
+                    % blocks[0][2],
+                )
+
+    return True, "ok"
+
+
+def _t_flac_decoding():
+    # this FLAC was generated and encoded by:
+    # ```bash
+    # LC_ALL=C printf '\x1f\xa6\xde\xba\xcc\x13\x7d\x74%s' TEST > test.cas &&
+    #     python3 cas2wav.py test.cas test.wav &&
+    #     sox test.wav test.flac &&
+    #     gzip -9 < test.flac | recode l1..l1/b64
+    # ```
+    flac = gzip.decompress(
+        base64.b64decode(
+            "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"
+            "jtOipV4yU/p4D/T6cfktq+jV+v4A6NNW2yOcAAA="
+        )
+    )
+    with tempfile.NamedTemporaryFile(delete=True) as temp_file:
+        temp_file.write(flac)
+        temp_file.flush()
+        with open_flac_as_wav(temp_file.name) as wf:
+            nchannels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            framerate = wf.getframerate()
+            nframes = wf.getnframes()
+            raw = wf.readframes(nframes)
+            if nchannels != 1:
+                return False, "channel count should be 1 but was %r" % nchannels
+            if sampwidth != 2:
+                return (
+                    False,
+                    "sample width should be 2 bytes but was %r bytes" % sampwidth,
+                )
+            if framerate != 22050:
+                return False, "frame rate should be 22050 but was %r" % framerate
+            if nframes != 131292:
+                return False, "frame count should be 131292 but was %r" % nframes
+            if len(raw) != sampwidth * nchannels * nframes:
+                return False, "raw sample data had the wrong length"
+            samples = _unpack_samples(raw, sampwidth)
+            edges_gen = find_all_edges(samples, 0.2)
+            half_periods_gen = edges_to_half_periods(edges_gen)
+            half_periods = list(half_periods_gen)
+            blocks = decode(half_periods, framerate)
+            if len(blocks) != 1:
+                return (
+                    False,
+                    "got wrong number of blocks: should be 1, instead %r" % len(blocks),
+                )
+            if blocks[0][0] != 1200:
+                return (
+                    False,
+                    "got wrong baud rate for block 0: should be 1200, instead %r"
+                    % blocks[0][0],
+                )
+            if blocks[0][1] != b"TEST":
+                return False, "got wrong data for block 0: should be %r, instead %r" % (
+                    b"TEST",
+                    blocks[0][1],
+                )
+            if blocks[0][2] < 0.9:
+                return (
+                    False,
+                    "too little confidence for block 0: should be at least 0.9, instead %r"
+                    % blocks[0][2],
+                )
+
+    return True, "ok"
+
+
 _SELF_TESTS = [
     ("basic multi-block decode", _t_basic_multiblock),
     ("strict vs. lenient stop bits", _t_strict_vs_lenient_stop_bits),
@@ -1573,6 +1745,8 @@ _SELF_TESTS = [
     ("polarity invariance", _t_polarity_invariance),
     ("stereo-to-mono channel selection", _t_stereo_to_mono),
     ("CAS --pad alignment", _t_pad_alignment),
+    ("WAV decoding", _t_wav_decoding),
+    ("FLAC decoding", _t_flac_decoding),
 ]
 
 
