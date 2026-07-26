@@ -5,7 +5,7 @@ Pure Python, standard library only. Inputs are converted to 16-bit signed PCM WA
 
 ## Usage
 
-```
+```bash
 python3 wav2cas.py [--filter] input.wav output.cas [options]
 ```
 
@@ -39,8 +39,8 @@ usage: wav2cas.py [-h] [--tolerance TOLERANCE]
                   [--min-confidence MIN_CONFIDENCE] [--no-edge-trim]
                   [--edge-trim-threshold EDGE_TRIM_THRESHOLD]
                   [--max-gap-multiple MAX_GAP_MULTIPLE] [--no-native-formats]
-                  [--stereo-to-mono {mix,left,right}] [--filter] [--pad]
-                  [--test] [-v]
+                  [--no-ffmpeg] [--stereo-to-mono {mix,left,right}] [--filter]
+                  [--pad] [--test] [-v]
                   [input] [output]
 
 Decode MSX or MSX-like cassette audio (WAV) into a .CAS file.
@@ -93,6 +93,8 @@ options:
                         no `subprocess` call is made. Use this if you'd rather
                         convert a non-WAV source to WAV yourself first (e.g.
                         with your own ffmpeg command)
+  --no-ffmpeg           do not use ffpmeg, but still allow the built-in FLAC
+                        decoder, which is very slow
   --stereo-to-mono {mix,left,right}
                         how to collapse a multi-channel input to mono: average
                         all channels together (default: mix), or use only the
@@ -103,6 +105,16 @@ options:
   --test                run internal self-tests and exit
   -v, --verbose         print decoding progress to stderr
 `````
+
+# cas2wav
+
+Converts MSX CAS to WAV. Generates 22050 Hz monaural 16-bit signed linear PCM with 1200 baud FSK.
+
+## Usage
+
+```bash
+python cas2wav.py input.cas output.wav
+```
 
 # Note on the code and the tools used to write it
 
