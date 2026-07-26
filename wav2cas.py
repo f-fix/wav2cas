@@ -157,12 +157,19 @@ def apply_band_filter(samples, framerate):
     """Crudely simulates cassette hardware input circuit response.
 
     Applies a DC-blocking high-pass filter (~300 Hz) and a gentle smoothing
-    low-pass filter (~6 kHz) to clean up tape rumble and high-frequency hiss.
+    low-pass filter (~6 kHz) to clean up tape rumble and high-frequency hiss
+    without phase distortion or breaking clean captures.
+
     This implementation modifies the input 'samples' array in-place to
     minimize memory overhead.
     """
     if not samples:
         return samples
+
+    # Filtering requires floating point. If the input array is integer-based,
+    # convert it to float32 to avoid TypeErrors and loss of precision.
+    if samples.typecode not in ("f", "d"):
+        samples = array.array("f", samples)
 
     hp_rc = 1.0 / (2.0 * math.pi * 300.0)
     dt = 1.0 / framerate
@@ -177,11 +184,16 @@ def apply_band_filter(samples, framerate):
 
     for i in range(len(samples)):
         cur_in = float(samples[i])
+
+        # High-pass step
         hp_out = hp_alpha * (prev_hp_out + cur_in - prev_in)
         prev_hp_out = hp_out
         prev_in = cur_in
+
+        # Low-pass step
         lp_out = prev_lp_val + lp_alpha * (hp_out - prev_lp_val)
         prev_lp_val = lp_out
+
         samples[i] = lp_out
 
     return samples
@@ -193,13 +205,11 @@ def apply_band_filter(samples, framerate):
 
 
 class PurePythonFlacDecoder:
-    """A low-performance pure Python FLAC decoder using memory buffering."""
+    """A pure Python FLAC decoder that streams from disk to save memory."""
 
     def __init__(self, file_path):
-        with open(file_path, "rb") as f:
-            self.data = f.read()
-
-        self.data_len = len(self.data)
+        self.f = open(file_path, "rb")
+        self.data_len = os.path.getsize(file_path)
         self.offset = 0
 
         self.sample_rate = 44100
@@ -211,14 +221,13 @@ class PurePythonFlacDecoder:
         self.bit_buffer = 0
         self.bit_count = 0
 
-        self.pcm_data = array.array("h")
         self._parse_flac()
 
     def _read_bytes(self, n):
-        if self.offset + n > self.data_len:
+        res = self.f.read(n)
+        if not res or len(res) < n:
             return None
-        res = self.data[self.offset : self.offset + n]
-        self.offset += n
+        self.offset += len(res)
         return res
 
     def _parse_flac(self):
@@ -241,7 +250,20 @@ class PurePythonFlacDecoder:
             if block_type == 0:  # STREAMINFO
                 self._parse_streaminfo(block_data)
 
-        # Read audio frames with compact carriage-return progress feedback
+    def _parse_streaminfo(self, data):
+        if len(data) < 34:
+            return
+        # Extract metadata from binary block
+        self.sample_rate = (data[10] << 12) | (data[11] << 4) | (data[12] >> 4)
+        self.channels = ((data[12] >> 1) & 0x07) + 1
+        bps = ((data[12] & 0x01) << 4) | (data[13] >> 4)
+        self.bits_per_sample = bps + 1
+        self.total_samples = ((data[13] & 0x0F) << 32) | int.from_bytes(
+            data[14:18], "big"
+        )
+
+    def stream_samples(self):
+        """Generator yielding decoded 16-bit PCM samples with progress reports."""
         while self.offset < self.data_len:
             percent = min(100.0, (self.offset / self.data_len) * 100.0)
             sys.stdout.write(f"\rDecoding FLAC: {percent:5.1f}%")
@@ -256,53 +278,33 @@ class PurePythonFlacDecoder:
                 sync_marker[0] == 0xFF
                 and (sync_marker[1] & 0xFE == 0xF8 or (sync_marker[1] & 0xFC) == 0xF0)
             ):
-                self.offset -= 2  # Rewind sync marker
-                self._parse_frame()
+                self.f.seek(-2, os.SEEK_CUR)
+                self.offset -= 2
+                yield from self._parse_frame()
             else:
-                self.offset -= 1  # Resync scan step
-
-        sys.stdout.write("\rDecoding FLAC: 100.0% - Complete!\n")
-        sys.stdout.flush()
-
-    def _parse_streaminfo(self, data):
-        if len(data) < 34:
-            return
-        sr_ch_bps_and_samples = data[10:26]
-        combined_val = struct.unpack(">I", sr_ch_bps_and_samples[:4])[0]
-
-        self.sample_rate = combined_val >> 12
-        self.channels = ((combined_val >> 9) & 0x07) + 1
-        self.bits_per_sample = ((combined_val >> 4) & 0x1F) + 1
-        self.total_samples = (
-            int.from_bytes(sr_ch_bps_and_samples[4:12], "big") & 0xFFFFFFFFF
-        )
+                self.f.seek(-1, os.SEEK_CUR)
+                self.offset -= 1
 
     def _parse_frame(self):
         self.bit_count = 0
         self.bit_buffer = 0
 
-        header_start = self._read_bytes(
-            2
-        )  # sync(14) + reserved(1) + blocking strategy(1)
+        header_start = self._read_bytes(2)
         if not header_start or len(header_start) < 2:
             return
 
-        bs_sr = self._read_bytes(1)  # block_size_code(4) | sample_rate_code(4)
+        bs_sr = self._read_bytes(1)
         if not bs_sr:
             return
         block_size_type = (bs_sr[0] >> 4) & 0x0F
         sample_rate_code = bs_sr[0] & 0x0F
 
-        ch_bps = self._read_bytes(
-            1
-        )  # channel_assignment(4) | sample_size_code(3) | reserved(1)
+        ch_bps = self._read_bytes(1)
         if not ch_bps:
             return
         channel_assignment = (ch_bps[0] >> 4) & 0x0F
 
-        # variable-length UTF-8-style encoded frame/sample number: the count of
-        # leading 1-bits in the first byte gives the number of continuation
-        # bytes that follow (same scheme as UTF-8 codepoint encoding)
+        # variable-length UTF-8-style encoded frame/sample number
         first = self._read_bytes(1)
         if not first:
             return
@@ -330,8 +332,6 @@ class PurePythonFlacDecoder:
         if block_size is None:
             return
 
-        # extra explicit sample-rate bytes (not otherwise used, just consumed
-        # so the CRC byte below lines up correctly)
         if sample_rate_code == 12:
             self._read_bytes(1)
         elif sample_rate_code in (13, 14):
@@ -362,9 +362,6 @@ class PurePythonFlacDecoder:
                 left, right = new_left, new_right
             subframe_samples = [left, right]
 
-        self.bit_count = 0
-        self.bit_buffer = 0
-
         for i in range(block_size):
             for ch in range(self.channels):
                 if i < len(subframe_samples[ch]):
@@ -376,7 +373,7 @@ class PurePythonFlacDecoder:
                         sample <<= 16 - self.bits_per_sample
 
                     sample = max(-32768, min(32767, sample))
-                    self.pcm_data.append(sample)
+                    yield sample
 
     def _get_block_size(self, bs_type):
         if bs_type == 1:
@@ -422,18 +419,18 @@ class PurePythonFlacDecoder:
 
             # Apply Fixed predictors
             if order == 1:
-                for i in range(order, block_size):
+                for i in range(1, block_size):
                     samples[i] += samples[i - 1]
             elif order == 2:
-                for i in range(order, block_size):
+                for i in range(2, block_size):
                     samples[i] += 2 * samples[i - 1] - samples[i - 2]
             elif order == 3:
-                for i in range(order, block_size):
+                for i in range(3, block_size):
                     samples[i] += (
                         3 * samples[i - 1] - 3 * samples[i - 2] + samples[i - 3]
                     )
             elif order == 4:
-                for i in range(order, block_size):
+                for i in range(4, block_size):
                     samples[i] += (
                         4 * samples[i - 1]
                         - 6 * samples[i - 2]
@@ -511,10 +508,10 @@ class PurePythonFlacDecoder:
         if n == 0:
             return 0
         while self.bit_count < n:
-            if self.offset >= self.data_len:
+            b = self._read_bytes(1)
+            if b is None:
                 return None
-            self.bit_buffer = (self.bit_buffer << 8) | self.data[self.offset]
-            self.offset += 1
+            self.bit_buffer = (self.bit_buffer << 8) | b[0]
             self.bit_count += 8
 
         self.bit_count -= n
@@ -550,43 +547,57 @@ class PurePythonFlacDecoder:
         else:
             return val >> 1
 
+    def close(self):
+        # Ensure the final progress line is cleared and completion is noted.
+        sys.stdout.write("\rDecoding FLAC: 100.0% - Complete!\n")
+        sys.stdout.flush()
+        self.f.close()
+
+
+class FlacStreamReader:
+    """Wraps FlacDecoder to mimic wave.Wave_read without memory buffers."""
+
+    def __init__(self, file_path):
+        self.decoder = PurePythonFlacDecoder(file_path)
+        self.sample_gen = self.decoder.stream_samples()
+
+    def getnchannels(self):
+        return self.decoder.channels
+
+    def getsampwidth(self):
+        return 2
+
+    def getframerate(self):
+        return self.decoder.sample_rate
+
+    def getnframes(self):
+        return self.decoder.total_samples
+
+    def readframes(self, n):
+        # Wave module expects bytes. We yield samples from generator and pack them.
+        samples = []
+        for _ in range(n * self.decoder.channels):
+            try:
+                samples.append(next(self.sample_gen))
+            except StopIteration:
+                break
+        if not samples:
+            return b""
+        return struct.pack(f"<{len(samples)}h", *samples)
+
+    def close(self):
+        self.decoder.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
 
 def open_flac_as_wav(file_path):
-    """Standalone helper function that accepts a FLAC file path and returns a standard wave.Wave_read object."""
-    decoder = PurePythonFlacDecoder(file_path)
-    pcm_data = decoder.pcm_data
-    data_length = len(pcm_data) * 2
-
-    wav_io = io.BytesIO()
-    riff_chunk_size = 36 + data_length
-    audio_format = 1  # PCM
-    channels = decoder.channels
-    sample_rate = decoder.sample_rate
-    bits_per_sample = 16  # Forced standard 16-bit downsampled layout
-    block_align = channels * (bits_per_sample // 8)
-    byte_rate = sample_rate * block_align
-
-    wav_io.write(b"RIFF")
-    wav_io.write(struct.pack("<I", riff_chunk_size))
-    wav_io.write(b"WAVE")
-
-    # fmt sub-chunk
-    wav_io.write(b"fmt ")
-    wav_io.write(struct.pack("<I", 16))
-    wav_io.write(struct.pack("<H", audio_format))
-    wav_io.write(struct.pack("<H", channels))
-    wav_io.write(struct.pack("<I", sample_rate))
-    wav_io.write(struct.pack("<I", byte_rate))
-    wav_io.write(struct.pack("<H", block_align))
-    wav_io.write(struct.pack("<H", bits_per_sample))
-
-    # data sub-chunk
-    wav_io.write(b"data")
-    wav_io.write(struct.pack("<I", data_length))
-    wav_io.write(pcm_data)
-
-    wav_io.seek(0)
-    return wave.open(wav_io, "rb")
+    """Standalone helper function that accepts a FLAC file path and returns a streaming Wave_read-like object."""
+    return FlacStreamReader(file_path)
 
 
 class DirectWavReader:
@@ -673,7 +684,7 @@ def open_wave_or_flac_for_reading(path, allow_native_formats=True, allow_ffmpeg=
             except Exception:
                 pass
         try:
-            # very slow but lets us use FLAC where we otherwise could not
+            # low RAM streaming fallback
             return open_flac_as_wav(path)
         except Exception:
             pass
@@ -686,7 +697,7 @@ def read_wav_mono(
     path, allow_native_formats=True, allow_ffmpeg=True, stereo_to_mono="mix"
 ):
     """Read a WAV file and return (samples, framerate). FLAC also
-    works, possibly much more slowly. Other formats may also work if
+    works, possibly much more slowly. other formats may also work if
     you have ffmpeg installed and available on your PATH.
 
     Memory efficiency: processes the input in chunks to avoid loading
@@ -695,15 +706,19 @@ def read_wav_mono(
 
     If allow_native_formats is False, the ffmpeg/FLAC fallbacks are
     skipped entirely and the file is read as plain WAV via the stdlib
-    `wave` module only - no `subprocess` call is made.
+    `wave` module only - no `subprocess` call is made. Use this if you'd
+    rather convert non-WAV sources to WAV yourself ahead of time (e.g. via
+    your own `ffmpeg` invocation) than have this tool shell out to ffmpeg
+    on your behalf.
 
     If allow_native_formats is True and allow_ffmpeg is False, the
     slow pure Python FLAC decoder will be used for FLAC files.
 
     stereo_to_mono controls how a multi-channel file is collapsed to
     mono: "mix" (default) averages all channels together, "left" uses
-    only the first channel, "right" uses only the second channel.
-    Ignored entirely for mono input.
+    only the first channel, "right" uses only the second channel. Ignored
+    entirely for mono input.
+
     """
     with open_wave_or_flac_for_reading(path, allow_native_formats, allow_ffmpeg) as wf:
         nchannels = wf.getnchannels()
@@ -736,11 +751,12 @@ def read_wav_mono(
                 elif stereo_to_mono == "right":
                     samples.extend(chunk_samples[1::nchannels])
                 else:
+                    # Mixing logic
                     for i in range(0, len(chunk_samples) - nchannels + 1, nchannels):
-                        s = 0.0
+                        s_sum = 0.0
                         for ch in range(nchannels):
-                            s += chunk_samples[i + ch]
-                        samples.append(s / nchannels)
+                            s_sum += chunk_samples[i + ch]
+                        samples.append(s_sum / nchannels)
             else:
                 samples.extend(chunk_samples)
 
@@ -855,13 +871,12 @@ def find_all_edges(
     # Performance optimization: Localize loop variables
     interp = _interp_zero
 
-    if agc:
-        # Hot loop version with AGC
-        for i, sample in enumerate(samples):
-            cur = float(sample)
-            bias = bias * (1.0 - bias_alpha) + cur * bias_alpha
-            v_adj = cur - bias
+    for i, sample in enumerate(samples):
+        cur = float(sample)
+        bias = bias * 0.998 + cur * 0.002
+        v_adj = cur - bias
 
+        if agc:
             abs_v = abs(v_adj)
             if abs_v > envelope:
                 envelope += (abs_v - envelope) * agc_attack
@@ -872,39 +887,21 @@ def find_all_edges(
                 envelope = floor
 
             local_threshold = envelope * threshold_ratio
+        else:
+            local_threshold = peak_file * threshold_ratio
 
-            if armed_high and prev_v_adj < 0 <= v_adj:
-                yield interp(i - 1, prev_v_adj, v_adj)
-                armed_high = False
-            elif armed_low and prev_v_adj > 0 >= v_adj:
-                yield interp(i - 1, prev_v_adj, v_adj)
-                armed_low = False
+        if armed_high and prev_v_adj < 0 <= v_adj:
+            yield interp(i - 1, prev_v_adj, v_adj)
+            armed_high = False
+        elif armed_low and prev_v_adj > 0 >= v_adj:
+            yield interp(i - 1, prev_v_adj, v_adj)
+            armed_low = False
 
-            if v_adj < -local_threshold:
-                armed_high = True
-            if v_adj > local_threshold:
-                armed_low = True
-            prev_v_adj = v_adj
-    else:
-        # Hot loop version without AGC
-        local_threshold = peak_file * threshold_ratio
-        for i, sample in enumerate(samples):
-            cur = float(sample)
-            bias = bias * (1.0 - bias_alpha) + cur * bias_alpha
-            v_adj = cur - bias
-
-            if armed_high and prev_v_adj < 0 <= v_adj:
-                yield interp(i - 1, prev_v_adj, v_adj)
-                armed_high = False
-            elif armed_low and prev_v_adj > 0 >= v_adj:
-                yield interp(i - 1, prev_v_adj, v_adj)
-                armed_low = False
-
-            if v_adj < -local_threshold:
-                armed_high = True
-            if v_adj > local_threshold:
-                armed_low = True
-            prev_v_adj = v_adj
+        if v_adj < -local_threshold:
+            armed_high = True
+        if v_adj > local_threshold:
+            armed_low = True
+        prev_v_adj = v_adj
 
 
 def _interp_zero(i0, v0, v1):
@@ -1005,6 +1002,7 @@ def decode(
         if verbose:
             print(msg, file=sys.stderr)
 
+    # Classification constants for speed
     C_SHORT, C_LONG, C_GAP = 1, 2, 3
 
     def classify(p):
@@ -1111,10 +1109,8 @@ def decode(
                 i += 1
                 if pilot_count >= min_pilot_pulses:
                     baud, f0, f1 = candidate
-                    long_nom = framerate / (2 * f0)
-                    short_nom = framerate / (2 * f1)
-                    long_avg = long_nom
-                    short_avg = short_nom
+                    long_nom = long_avg = framerate / (2 * f0)
+                    short_nom = short_avg = framerate / (2 * f1)
                     threshold = (long_avg + short_avg) / 2
                     log(
                         "[pilot] locked baud=%d (f0=%gHz f1=%gHz) near pulse %d"
@@ -1140,10 +1136,8 @@ def decode(
                     match = _best_baud_match(freq, tolerance)
                     if match is not None and match[0] != baud:
                         baud, f0, f1 = match
-                        long_nom = framerate / (2 * f0)
-                        short_nom = framerate / (2 * f1)
-                        long_avg = long_nom
-                        short_avg = short_nom
+                        long_nom = long_avg = framerate / (2 * f0)
+                        short_nom = short_avg = framerate / (2 * f1)
                         threshold = (long_avg + short_avg) / 2
                         log(
                             "[pilot] re-locked baud=%d (f0=%gHz f1=%gHz) near pulse %d"
@@ -1288,7 +1282,7 @@ def _test_decode_samples(
     samples, framerate=_TEST_FRAMERATE, threshold_ratio=0.2, agc=True, **decode_kwargs
 ):
     edges = find_all_edges(samples, threshold_ratio, agc=agc)
-    half_periods = list(edges_to_half_periods(edges))
+    half_periods = array.array("f", edges_to_half_periods(edges))
     return decode(half_periods, framerate, **decode_kwargs)
 
 
