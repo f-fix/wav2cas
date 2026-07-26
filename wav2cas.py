@@ -274,92 +274,115 @@ class PurePythonFlacDecoder:
                 break
 
             # Check for sync code (14 bits set to 1 -> 0xFFF)
-            if len(sync_marker) == 2 and (
-                sync_marker[0] == 0xFF
-                and (sync_marker[1] & 0xFE == 0xF8 or (sync_marker[1] & 0xFC) == 0xF0)
+            if (
+                len(sync_marker) == 2
+                and sync_marker[0] == 0xFF
+                and (sync_marker[1] & 0xFC) == 0xF8
             ):
                 self.f.seek(-2, os.SEEK_CUR)
                 self.offset -= 2
-                yield from self._parse_frame()
+                try:
+                    yield from self._parse_frame()
+                except (ValueError, IndexError, struct.error, EOFError):
+                    # Skip the sync and search again if a frame is corrupt
+                    self.f.seek(2, os.SEEK_CUR)
+                    self.offset += 2
             else:
                 self.f.seek(-1, os.SEEK_CUR)
                 self.offset -= 1
+
+    def _read_utf8(self):
+        """Read variable-length frame/sample number from bitstream."""
+        v = self._read_bits(8)
+        if v is None:
+            return 0
+        if v < 0x80:
+            return v
+        elif 0xC0 <= v <= 0xDF:
+            n, val = 1, v & 0x1F
+        elif 0xE0 <= v <= 0xEF:
+            n, val = 2, v & 0x0F
+        elif 0xF0 <= v <= 0xF7:
+            n, val = 3, v & 0x07
+        elif 0xF8 <= v <= 0xFB:
+            n, val = 4, v & 0x03
+        elif 0xFC <= v <= 0xFD:
+            n, val = 5, v & 0x01
+        else:
+            return 0
+        for _ in range(n):
+            val = (val << 6) | (self._read_bits(8) & 0x3F)
+        return val
 
     def _parse_frame(self):
         self.bit_count = 0
         self.bit_buffer = 0
 
-        header_start = self._read_bytes(2)
-        if not header_start or len(header_start) < 2:
-            return
+        # Read Header Fields
+        self._read_bits(14)  # sync
+        self._read_bits(1)  # reserved
+        self._read_bits(1)  # blocking strategy
 
-        bs_sr = self._read_bytes(1)
-        if not bs_sr:
-            return
-        block_size_type = (bs_sr[0] >> 4) & 0x0F
-        sample_rate_code = bs_sr[0] & 0x0F
+        bs_code = self._read_bits(4)
+        sr_code = self._read_bits(4)
+        ch_assignment = self._read_bits(4)
+        self._read_bits(3)  # sample size code
+        self._read_bits(1)  # reserved
 
-        ch_bps = self._read_bytes(1)
-        if not ch_bps:
-            return
-        channel_assignment = (ch_bps[0] >> 4) & 0x0F
+        # Read variable-length frame/sample number
+        self._read_utf8()
 
-        # variable-length UTF-8-style encoded frame/sample number
-        first = self._read_bytes(1)
-        if not first:
-            return
-        first_byte = first[0]
-        if first_byte & 0x80 == 0x00:
-            continuation_bytes = 0
-        elif first_byte & 0xE0 == 0xC0:
-            continuation_bytes = 1
-        elif first_byte & 0xF0 == 0xE0:
-            continuation_bytes = 2
-        elif first_byte & 0xF8 == 0xF0:
-            continuation_bytes = 3
-        elif first_byte & 0xFC == 0xF8:
-            continuation_bytes = 4
-        elif first_byte & 0xFE == 0xFC:
-            continuation_bytes = 5
-        elif first_byte == 0xFE:
-            continuation_bytes = 6
+        # Resolve block size
+        if bs_code == 1:
+            block_size = 192
+        elif 2 <= bs_code <= 5:
+            block_size = 576 << (bs_code - 2)
+        elif bs_code == 6:
+            block_size = self._read_bits(8) + 1
+        elif bs_code == 7:
+            block_size = self._read_bits(16) + 1
+        elif 8 <= bs_code <= 15:
+            block_size = 256 << (bs_code - 8)
         else:
-            continuation_bytes = 0
-        if continuation_bytes and not self._read_bytes(continuation_bytes):
             return
 
-        block_size = self._get_block_size(block_size_type)
-        if block_size is None:
-            return
+        # Resolve sample rate extra bytes
+        if sr_code == 12:
+            self._read_bits(8)
+        elif sr_code in (13, 14):
+            self._read_bits(16)
 
-        if sample_rate_code == 12:
-            self._read_bytes(1)
-        elif sample_rate_code in (13, 14):
-            self._read_bytes(2)
-
-        self._read_bytes(1)  # Skip CRC-8 header byte
+        self._read_bits(8)  # Skip CRC-8 header byte
 
         subframe_samples = []
         for ch in range(self.channels):
-            sub_samples = self._parse_subframe(block_size)
+            # RFC 9639: Side channels in decorrelated states have bps + 1
+            cur_bps = self.bits_per_sample
+            if (
+                (ch_assignment == 8 and ch == 1)
+                or (ch_assignment == 9 and ch == 0)
+                or (ch_assignment == 10 and ch == 1)
+            ):
+                cur_bps += 1
+            sub_samples = self._parse_subframe(block_size, cur_bps)
             subframe_samples.append(sub_samples)
 
-        # Apply Channel Decorrelation if stereo assignment matches
+        # Apply Channel Decorrelation (RFC 9639 bit-exact)
         if self.channels == 2 and len(subframe_samples) == 2:
-            left = subframe_samples[0]
-            right = subframe_samples[1]
-            if channel_assignment == 8:  # Left/Side -> R = L - S
-                right = [l - s for l, s in zip(left, right)]
-            elif channel_assignment == 9:  # Side/Right -> L = R + S
-                left = [r + s for r, s in zip(right, left)]
-            elif channel_assignment == 10:  # Mid/Side -> L = M + S/2, R = M - S/2
-                new_left = []
-                new_right = []
-                for m, s in zip(left, right):
-                    res = s >> 1
-                    new_left.append(m + res - (s & 1 & (s < 0)))
-                    new_right.append(m - res)
-                left, right = new_left, new_right
+            left, right = subframe_samples[0], subframe_samples[1]
+            if ch_assignment == 8:  # Left/Side -> R = L - S
+                for i in range(block_size):
+                    right[i] = left[i] - right[i]
+            elif ch_assignment == 9:  # Side/Right -> L = R + S
+                for i in range(block_size):
+                    left[i] = left[i] + right[i]
+            elif ch_assignment == 10:  # Mid/Side
+                for i in range(block_size):
+                    mid, side = left[i], right[i]
+                    left[i] = mid + (side >> 1)
+                    if side & 1:
+                        left[i] += 1
+                    right[i] = left[i] - side
             subframe_samples = [left, right]
 
         for i in range(block_size):
@@ -390,30 +413,32 @@ class PurePythonFlacDecoder:
             return 256 << (bs_type - 8)
         return None
 
-    def _parse_subframe(self, block_size):
-        sub_header = self._read_bytes(1)
-        if not sub_header:
+    def _parse_subframe(self, block_size, bps):
+        sub_header = self._read_bits(8)
+        if sub_header is None:
             return [0] * block_size
 
-        byte_val = sub_header[0]
-        sub_type = (byte_val >> 1) & 0x3F
+        sub_type = (sub_header >> 1) & 0x3F
 
         wasted_bits = 0
-        if (byte_val & 0x01) != 0:
+        if (sub_header & 0x01) != 0:
             wasted_bits = self._read_unary() + 1
+            if wasted_bits >= bps:
+                wasted_bits = 0  # Safety cap
 
         samples = [0] * block_size
+        bps_eff = bps - wasted_bits
 
         if sub_type == 0:
-            sample = self._read_signed_bits(self.bits_per_sample)
+            sample = self._read_signed_bits(bps_eff)
             samples = [sample] * block_size
         elif sub_type == 1:
             for i in range(block_size):
-                samples[i] = self._read_signed_bits(self.bits_per_sample)
+                samples[i] = self._read_signed_bits(bps_eff)
         elif 8 <= sub_type <= 12:
             order = sub_type - 8
             for i in range(order):
-                samples[i] = self._read_signed_bits(self.bits_per_sample)
+                samples[i] = self._read_signed_bits(bps_eff)
 
             samples = self._parse_residual(block_size, order, samples)
 
@@ -441,20 +466,10 @@ class PurePythonFlacDecoder:
         elif 32 <= sub_type <= 63:
             order = sub_type - 31
             for i in range(order):
-                samples[i] = self._read_signed_bits(self.bits_per_sample)
+                samples[i] = self._read_signed_bits(bps_eff)
 
-            # LPC header: precision (4 bits), shift (5 bits, UNSIGNED per the
-            # FLAC spec - reading this as signed was the bug: any real shift
-            # value of 16-31 has its top bit set and would get misread as a
-            # small negative number, which then flipped "pred >> shift"
-            # (divide) into "pred << -shift" (multiply) below. Since this is
-            # a *recursive* predictor (each sample depends on previous
-            # predicted samples), multiplying instead of dividing at every
-            # step causes the values - and the cost of doing arbitrary-
-            # precision Python arithmetic on them - to blow up exponentially
-            # within a single subframe.
             prec = self._read_bits(4) + 1
-            shift = self._read_bits(5)
+            shift = self._read_signed_bits(5)
             coeffs = [self._read_signed_bits(prec) for _ in range(order)]
 
             samples = self._parse_residual(block_size, order, samples)
@@ -487,13 +502,11 @@ class PurePythonFlacDecoder:
 
             escape = (1 << param_len) - 1
 
-            # Handle unencoded binary residual payload
             if param == escape:
-                bps = self._read_bits(5)
+                bps_res = self._read_bits(5)
             else:
-                bps = 0
+                bps_res = 0
 
-            # Partition 0 is short by `order` samples
             samples_in_partition = part_samples if p > 0 else part_samples - order
 
             for _ in range(samples_in_partition):
@@ -501,7 +514,7 @@ class PurePythonFlacDecoder:
                     break
 
                 if param == escape:
-                    val = self._read_signed_bits(bps) if bps > 0 else 0
+                    val = self._read_signed_bits(bps_res) if bps_res > 0 else 0
                 else:
                     val = self._read_rice_signed(param)
 
@@ -514,14 +527,19 @@ class PurePythonFlacDecoder:
         if n == 0:
             return 0
         while self.bit_count < n:
-            b = self._read_bytes(1)
-            if b is None:
-                return None
+            b = self.f.read(1)
+            if not b:
+                raise EOFError("Unexpected end of file")
             self.bit_buffer = (self.bit_buffer << 8) | b[0]
             self.bit_count += 8
+            self.offset += 1
 
         self.bit_count -= n
-        return (self.bit_buffer >> self.bit_count) & ((1 << n) - 1)
+        res = (self.bit_buffer >> self.bit_count) & ((1 << n) - 1)
+        self.bit_buffer &= (
+            1 << self.bit_count
+        ) - 1  # Prevent integer explosion (OOM fix)
+        return res
 
     def _read_signed_bits(self, n):
         if n == 0:
@@ -540,6 +558,8 @@ class PurePythonFlacDecoder:
             if bit is None or bit == 1:
                 break
             count += 1
+            if count > 1024:
+                raise ValueError("Malformed Unary code")  # OOM Safety
         return count
 
     def _read_rice_signed(self, param):
@@ -548,6 +568,7 @@ class PurePythonFlacDecoder:
             low = self._read_bits(param)
             if low is not None:
                 val = (val << param) | low
+        # Zig-zag decoding: val/2 if even, -(val+1)/2 if odd
         if val & 1:
             return -((val >> 1) + 1)
         else:
