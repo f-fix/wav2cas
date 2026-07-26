@@ -107,8 +107,8 @@ LIMITATIONS:
 import argparse
 import array
 import base64
-import gzip
 import io
+import lzma
 import math
 import os
 import random
@@ -1564,23 +1564,15 @@ def _t_wav_decoding():
     # ```bash
     # LC_ALL=C printf '\x1f\xa6\xde\xba\xcc\x13\x7d\x74%s' TEST > test.cas &&
     #     python3 cas2wav.py test.cas test.wav &&
-    #     gzip -9 < test.wav | recode l1..l1/b64
+    #     lzma -9 < test.wav | recode l1..l1/b64
     # ```
-    wav = gzip.decompress(
+    wav = lzma.decompress(
         base64.b64decode(
-            "H4sIAO6xZWoCA+3UvQnCUBSA0as4gBMEcYuAjaCChY2FWtgIIqSwc5e3QMDGKpUDSKawySYmO1gY"
-            "OV+6cx/JC/nZrler92AU+/luebneJuOIGLTHdBexeEQMYxzn0+30bNdEpHx2SJsyOzZF9boXNSGE"
-            "EEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBC"
-            "CCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQggh"
-            "hBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQ"
-            "QgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEII"
-            "IYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGE"
-            "EEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBC"
-            "CCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQggh"
-            "hBBCCCGEEEIIIYQQQgghhJB+SpmlPG1mh85TXmYR7azupu28Kupj870139pPH8/zr/fex3ejj9fy"
-            "XfhH/cKzkCRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJ"
-            "kiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJkiRJ"
-            "kiRJkiRJkiRJkiRJkiRJkiRJkiT9cx9DHaLo5AEEAA=="
+            "XQAAAAT//////////wApEkTrmN6NWD9/VTXn4ecOY4FtT/55rcJhTYtnpJCd4o6aYb7RT0LxXkXn"
+            "eXkXdZsVx3Y2qc66oczkz6UyaM5IWk9BKZhm+OBqFKV+D0txo48GT9zniR2UxYDvOBBxDFxj2A9H"
+            "cutnvsNI9xkHHnLrtIStSTt+FVNDooHcDhNSB+jp5vOCIwiriVOwEjLd6gTJqK9WzqK1+bGapwXe"
+            "FYlB3hCkARratbya1H/bNy2SHnF14rcKm0n4nJ1Zdv3LGRoQI4Fmv+0q7rxZUVprFnw7oIUs4qv2"
+            "3CaO2eTG1kOfZXK9Ut/G41lfBUEe+4JokA=="
         )
     )
     with tempfile.NamedTemporaryFile(delete=True) as temp_file:
@@ -1642,38 +1634,35 @@ def _t_flac_decoding():
     # LC_ALL=C printf '\x1f\xa6\xde\xba\xcc\x13\x7d\x74%s' TEST > test.cas &&
     #     python3 cas2wav.py test.cas test.wav &&
     #     sox test.wav test.flac &&
-    #     gzip -9 < test.flac | recode l1..l1/b64
+    #     lzma -9 < test.flac | recode l1..l1/b64
     # ```
-    flac = gzip.decompress(
+    flac = lzma.decompress(
         base64.b64decode(
-            "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"
-            "jtOipV4yU/p4D/T6cfktq+jV+v4A6NNW2yOcAAA="
+            "XQAAAAT//////////wAzEwgkM50kAdH8kEkfn89flLJ1iXo7gnrFhkCP9E0oPgmfY+88HZt4toR5"
+            "RnW97UJzHD8Ay+3XIhI2oCe8xVdCWj5ts/2OkvMFWFa6EiAbEPU2QSo/RiE4gWapsUAFVxL2wxmc"
+            "kljCjY2VZNCFoN71fFxGMR9lQVy6w43qRIsi/nysAm8ambx3qtHJFbdK6KBpFoDhz3nBRi+LWCye"
+            "BrZq0jU+qO9kmuHWEWAFbPEfbk4kZ9V/pkUJsA/wdzoE75AhXj90gD9eWfjMHhYYXmlYuAE0Nfl7"
+            "fWWtU1iiDzN2SNp8QdYsALsb16pSoIg02HAclcSgSXYN0BNjYYBr4GHH5YrX9TzczRfHBNecoH8I"
+            "9Lk4wS4PvvkQfcZ4odw0Prolkogzm5N5w0Gyi89M/Q9MM/YUmsQ9CPHN4uZ3P3+P6Us9RKXjyhw6"
+            "lZtWBcRs19vjll8a52/SS0FVvLIOGUvCk3gv2CIAc7YJ64J8fZqjxQFJL79LBWm9a7RbeN0xjA4s"
+            "V9t9v9l2FeHRcTbqFZQsZDO7ep7oyZb6KqaLGaCX7o4MNa4owEdEUdflrOQMOA8cAUI2MocIY93w"
+            "0MCpCeepQ4o7JnqmhdokVlOTsdlxpdS2nWFHF274Vm4yoZK2AKaWSwbmj1Kgr86zw2c0UsSBxQC5"
+            "liBfkk6cRIUSZL8K5nMq9yQn1cc2zFFTMh/zjJEzIcDmI7LZ75bETdaKBD6H7G8Hl5kdmpgQBMjP"
+            "Ou+OsnzL5jCS6DUSeu32r86O4PVzq9TkunkaF7fxvDG3Z2OS6JgiHdvOPSsegEO2hzOKkvG5NXk3"
+            "3R7VtrvYJZm1wbQtSwCghINFMMLd3MDA59+UlJ45SkNHrNUUPl8cUfwwF2XJpefy8OBugLe8nxot"
+            "v2okqdoY7+CmbVi6tugKJLAiVwsZeEyYvrMPcEaB/a6X8Y/uJvDKbbtEncQEUvSgaFbRgkrVBwrQ"
+            "gFKNVMKke0X3AEeIF2s/NPlRgYHxashdV7Sm8dwpT/h0y8T+67b4irbPEHMaDjjQFyEOY2AQw53C"
+            "RSDBA8DyGiGmLUoe4V/aoV5vGaW0Twwsi8i466hwdE/gecBP73rVt3DeBC90jXkgmZkx+rn4uudC"
+            "idL7nUHPK9VkQeP3eDk9iNAQ5beQElXi3pOUGi1/Eeg5neJ2LXzn6Yb1+xIekdKFrdB+u7eEDWDg"
+            "0V9wtZfG7WknQx1Y7ui8myZOSfPx8IJOpbshGPjaPHtmOE8m8iYUSGcUeON2BBxC7sS2fEvwoyaF"
+            "7WQ9KqQ+MmWVYkD9QWF8qtTUeL89XaUr7IRgHgYdroNqv7ystV/AoUDwR5uzPUgQTh4OpJKQPZe/"
+            "qKyZcQhTZ0eiKB5pwOJ9nScr6kq0RDCk9g2bJgkOSVnaQupRgQPuCKP3b32F/HcNXtf9bdPTyEDR"
+            "toA9nR2n9ujore80mYfCDKGUDhYiH+gaVErUSIgP9CBR6WTrLxmtXx8zrEtmAO2Jn1dKSc6LOwxz"
+            "IzDwJjt1bYfAMKZ9Or9Xpp9Gafiu2oaZ1TL4I/56rzkHbMlW3xWt62I2FLHPzEfOrSgZSQcVlXMK"
+            "XO9m0EpabEGHZq+4cc6X0hxksAiICGgpZvZQc5Dxs+aaYpmwpTz3m4iYAL7WAZx5Iwh1hn/qf1Z/"
+            "oGyjk932jKWNN0jZuTigaLnLYxljyL4hI377V4Uk0qD5tYX6CYgqKe+VbMb4nsgdJAKm9WCKAKMl"
+            "xWKZ4RAONStovwA6Uma5njuu/R6ZpSjYSD8fuQ2YCusTNaJ7lfzoTBc6/i0sCMsbUsxnYfagZm8F"
+            "raUDZQjgH0Q8lX1lDuT+Z8Cf"
         )
     )
     with tempfile.NamedTemporaryFile(delete=True) as temp_file:
