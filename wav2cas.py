@@ -99,7 +99,8 @@ LIMITATIONS:
     off. it will automatically fall back to a slow internal decoder
     for FLAC inputs if `ffmpeg` doesn't work, but
     `--no-native-formats` likewise turns this off and makes it
-    WAV-only.
+    WAV-only. The `--no-ffmpeg` flag skips ffmpeg but still allows
+    slow pure Python FLAC decoding.
 
 """
 
@@ -285,26 +286,61 @@ class PurePythonFlacDecoder:
         self.bit_count = 0
         self.bit_buffer = 0
 
-        header_start = self._read_bytes(2)
+        header_start = self._read_bytes(
+            2
+        )  # sync(14) + reserved(1) + blocking strategy(1)
         if not header_start or len(header_start) < 2:
             return
 
-        if not self._read_bytes(1):  # block strategy / numbering
-            return
-
-        bs_sr = self._read_bytes(1)
+        bs_sr = self._read_bytes(1)  # block_size_code(4) | sample_rate_code(4)
         if not bs_sr:
             return
         block_size_type = (bs_sr[0] >> 4) & 0x0F
+        sample_rate_code = bs_sr[0] & 0x0F
 
-        ch_bps = self._read_bytes(1)
+        ch_bps = self._read_bytes(
+            1
+        )  # channel_assignment(4) | sample_size_code(3) | reserved(1)
         if not ch_bps:
             return
         channel_assignment = (ch_bps[0] >> 4) & 0x0F
 
+        # variable-length UTF-8-style encoded frame/sample number: the count of
+        # leading 1-bits in the first byte gives the number of continuation
+        # bytes that follow (same scheme as UTF-8 codepoint encoding)
+        first = self._read_bytes(1)
+        if not first:
+            return
+        first_byte = first[0]
+        if first_byte & 0x80 == 0x00:
+            continuation_bytes = 0
+        elif first_byte & 0xE0 == 0xC0:
+            continuation_bytes = 1
+        elif first_byte & 0xF0 == 0xE0:
+            continuation_bytes = 2
+        elif first_byte & 0xF8 == 0xF0:
+            continuation_bytes = 3
+        elif first_byte & 0xFC == 0xF8:
+            continuation_bytes = 4
+        elif first_byte & 0xFE == 0xFC:
+            continuation_bytes = 5
+        elif first_byte == 0xFE:
+            continuation_bytes = 6
+        else:
+            continuation_bytes = 0
+        if continuation_bytes and not self._read_bytes(continuation_bytes):
+            return
+
         block_size = self._get_block_size(block_size_type)
         if block_size is None:
             return
+
+        # extra explicit sample-rate bytes (not otherwise used, just consumed
+        # so the CRC byte below lines up correctly)
+        if sample_rate_code == 12:
+            self._read_bytes(1)
+        elif sample_rate_code in (13, 14):
+            self._read_bytes(2)
 
         self._read_bytes(1)  # Skip CRC-8 header byte
 
@@ -577,19 +613,20 @@ def open_via_ffmpeg_as_wav(file_path):
     return DirectWavReader(temp_wav.name, wav_obj)
 
 
-def open_wave_or_flac_for_reading(path, allow_native_formats=True):
+def open_wave_or_flac_for_reading(path, allow_native_formats=True, allow_ffmpeg=True):
     if allow_native_formats:
         try:
             # should be fast when it works at all
             return wave.open(path, "rb")
         except Exception:
             pass
-        try:
-            # should be relatively fast when it works at all, and
-            # supports more formats
-            return open_via_ffmpeg_as_wav(path)
-        except Exception:
-            pass
+        if allow_ffmpeg:
+            try:
+                # should be relatively fast when it works at all, and
+                # supports more formats
+                return open_via_ffmpeg_as_wav(path)
+            except Exception:
+                pass
         try:
             # very slow but lets us use FLAC where we otherwise could not
             return open_flac_as_wav(path)
@@ -600,7 +637,9 @@ def open_wave_or_flac_for_reading(path, allow_native_formats=True):
     return wave.open(path, "rb")
 
 
-def read_wav_mono(path, allow_native_formats=True, stereo_to_mono="mix"):
+def read_wav_mono(
+    path, allow_native_formats=True, allow_ffmpeg=True, stereo_to_mono="mix"
+):
     """Read a WAV file and return (samples, framerate). FLAC also
     works, possibly much more slowly. other formats may also work if
     you have ffmpeg installed and available on your PATH.
@@ -612,13 +651,16 @@ def read_wav_mono(path, allow_native_formats=True, stereo_to_mono="mix"):
     your own `ffmpeg` invocation) than have this tool shell out to ffmpeg
     on your behalf.
 
+    If allow_native_formats is True and allow_ffmpeg is False, the
+    slow pure Python FLAC decoder will be used for FLAC files.
+
     stereo_to_mono controls how a multi-channel file is collapsed to
     mono: "mix" (default) averages all channels together, "left" uses
     only the first channel, "right" uses only the second channel. Ignored
     entirely for mono input.
 
     """
-    with open_wave_or_flac_for_reading(path, allow_native_formats) as wf:
+    with open_wave_or_flac_for_reading(path, allow_native_formats, allow_ffmpeg) as wf:
         nchannels = wf.getnchannels()
         sampwidth = wf.getsampwidth()
         framerate = wf.getframerate()
@@ -1620,6 +1662,11 @@ def main():
         "convert a non-WAV source to WAV yourself first (e.g. with your own ffmpeg command)",
     )
     parser.add_argument(
+        "--no-ffmpeg",
+        action="store_true",
+        help="do not use ffpmeg, but still allow the built-in FLAC decoder, which is very slow",
+    )
+    parser.add_argument(
         "--stereo-to-mono",
         choices=("mix", "left", "right"),
         default="mix",
@@ -1656,6 +1703,7 @@ def main():
     samples, framerate = read_wav_mono(
         args.input,
         allow_native_formats=not args.no_native_formats,
+        allow_ffmpeg=not args.no_ffmpeg,
         stereo_to_mono=args.stereo_to_mono,
     )
     print("%d samples at %d Hz" % (len(samples), framerate), file=sys.stderr)
