@@ -157,8 +157,9 @@ def apply_band_filter(samples, framerate):
     """Crudely simulates cassette hardware input circuit response.
 
     Applies a DC-blocking high-pass filter (~300 Hz) and a gentle smoothing
-    low-pass filter (~6 kHz) to clean up tape rumble and high-frequency hiss
-    without phase distortion or breaking clean captures.
+    low-pass filter (~6 kHz) to clean up tape rumble and high-frequency hiss.
+    This implementation modifies the input 'samples' array in-place to
+    minimize memory overhead.
     """
     if not samples:
         return samples
@@ -170,28 +171,20 @@ def apply_band_filter(samples, framerate):
     lp_rc = 1.0 / (2.0 * math.pi * 6000.0)
     lp_alpha = dt / (lp_rc + dt)
 
-    # Use a single output array and single pass to save memory and time
-    filtered = array.array("f", [0.0]) * len(samples)
-
     prev_in = float(samples[0])
     prev_hp_out = 0.0
     prev_lp_val = 0.0
 
     for i in range(len(samples)):
         cur_in = float(samples[i])
-
-        # High-pass step
         hp_out = hp_alpha * (prev_hp_out + cur_in - prev_in)
         prev_hp_out = hp_out
         prev_in = cur_in
-
-        # Low-pass step
         lp_out = prev_lp_val + lp_alpha * (hp_out - prev_lp_val)
         prev_lp_val = lp_out
+        samples[i] = lp_out
 
-        filtered[i] = lp_out
-
-    return filtered
+    return samples
 
 
 # --------------------------------------------------------------------------
@@ -218,7 +211,7 @@ class PurePythonFlacDecoder:
         self.bit_buffer = 0
         self.bit_count = 0
 
-        self.pcm_data = bytearray()
+        self.pcm_data = array.array("h")
         self._parse_flac()
 
     def _read_bytes(self, n):
@@ -383,7 +376,7 @@ class PurePythonFlacDecoder:
                         sample <<= 16 - self.bits_per_sample
 
                     sample = max(-32768, min(32767, sample))
-                    self.pcm_data.extend(struct.pack("<h", sample))
+                    self.pcm_data.append(sample)
 
     def _get_block_size(self, bs_type):
         if bs_type == 1:
@@ -561,8 +554,8 @@ class PurePythonFlacDecoder:
 def open_flac_as_wav(file_path):
     """Standalone helper function that accepts a FLAC file path and returns a standard wave.Wave_read object."""
     decoder = PurePythonFlacDecoder(file_path)
-    pcm_bytes = bytes(decoder.pcm_data)
-    data_length = len(pcm_bytes)
+    pcm_data = decoder.pcm_data
+    data_length = len(pcm_data) * 2
 
     wav_io = io.BytesIO()
     riff_chunk_size = 36 + data_length
@@ -590,7 +583,7 @@ def open_flac_as_wav(file_path):
     # data sub-chunk
     wav_io.write(b"data")
     wav_io.write(struct.pack("<I", data_length))
-    wav_io.write(pcm_bytes)
+    wav_io.write(pcm_data)
 
     wav_io.seek(0)
     return wave.open(wav_io, "rb")
@@ -693,47 +686,67 @@ def read_wav_mono(
     path, allow_native_formats=True, allow_ffmpeg=True, stereo_to_mono="mix"
 ):
     """Read a WAV file and return (samples, framerate). FLAC also
-    works, possibly much more slowly. other formats may also work if
+    works, possibly much more slowly. Other formats may also work if
     you have ffmpeg installed and available on your PATH.
+
+    Memory efficiency: processes the input in chunks to avoid loading
+    the entire raw PCM file into memory at once, which is critical for
+    large recordings.
 
     If allow_native_formats is False, the ffmpeg/FLAC fallbacks are
     skipped entirely and the file is read as plain WAV via the stdlib
-    `wave` module only - no `subprocess` call is made. Use this if you'd
-    rather convert non-WAV sources to WAV yourself ahead of time (e.g. via
-    your own `ffmpeg` invocation) than have this tool shell out to ffmpeg
-    on your behalf.
+    `wave` module only - no `subprocess` call is made.
 
     If allow_native_formats is True and allow_ffmpeg is False, the
     slow pure Python FLAC decoder will be used for FLAC files.
 
     stereo_to_mono controls how a multi-channel file is collapsed to
     mono: "mix" (default) averages all channels together, "left" uses
-    only the first channel, "right" uses only the second channel. Ignored
-    entirely for mono input.
-
+    only the first channel, "right" uses only the second channel.
+    Ignored entirely for mono input.
     """
     with open_wave_or_flac_for_reading(path, allow_native_formats, allow_ffmpeg) as wf:
         nchannels = wf.getnchannels()
         sampwidth = wf.getsampwidth()
         framerate = wf.getframerate()
         nframes = wf.getnframes()
-        raw = wf.readframes(nframes)
 
-    samples = _unpack_samples(raw, sampwidth)
-
-    if nchannels > 1:
-        if stereo_to_mono == "left":
-            samples = samples[0::nchannels]
-        elif stereo_to_mono == "right":
-            samples = samples[1::nchannels]
+        if nchannels > 1 and stereo_to_mono == "mix":
+            samples = array.array("f")
         else:
-            mono = array.array("f")
-            for i in range(0, len(samples) - nchannels + 1, nchannels):
-                frame = samples[i : i + nchannels]
-                mono.append(sum(frame) / nchannels)
-            samples = mono
+            samples = None
 
-    return samples, framerate
+        chunk_size = 65536
+        frames_read = 0
+
+        while frames_read < nframes:
+            count = min(chunk_size, nframes - frames_read)
+            raw = wf.readframes(count)
+            if not raw:
+                break
+
+            chunk_samples = _unpack_samples(raw, sampwidth)
+
+            if samples is None:
+                samples = array.array(chunk_samples.typecode)
+
+            if nchannels > 1:
+                if stereo_to_mono == "left":
+                    samples.extend(chunk_samples[0::nchannels])
+                elif stereo_to_mono == "right":
+                    samples.extend(chunk_samples[1::nchannels])
+                else:
+                    for i in range(0, len(chunk_samples) - nchannels + 1, nchannels):
+                        s = 0.0
+                        for ch in range(nchannels):
+                            s += chunk_samples[i + ch]
+                        samples.append(s / nchannels)
+            else:
+                samples.extend(chunk_samples)
+
+            frames_read += count
+
+    return samples if samples is not None else array.array("f"), framerate
 
 
 # Reinterpreting an unsigned byte (0..255) as signed-after-subtracting-128 is
@@ -846,7 +859,7 @@ def find_all_edges(
         # Hot loop version with AGC
         for i, sample in enumerate(samples):
             cur = float(sample)
-            bias += (cur - bias) * bias_alpha
+            bias = bias * (1.0 - bias_alpha) + cur * bias_alpha
             v_adj = cur - bias
 
             abs_v = abs(v_adj)
@@ -877,7 +890,7 @@ def find_all_edges(
         local_threshold = peak_file * threshold_ratio
         for i, sample in enumerate(samples):
             cur = float(sample)
-            bias += (cur - bias) * bias_alpha
+            bias = bias * (1.0 - bias_alpha) + cur * bias_alpha
             v_adj = cur - bias
 
             if armed_high and prev_v_adj < 0 <= v_adj:
@@ -992,12 +1005,14 @@ def decode(
         if verbose:
             print(msg, file=sys.stderr)
 
+    C_SHORT, C_LONG, C_GAP = 1, 2, 3
+
     def classify(p):
         if p < threshold:
-            return "short"
+            return C_SHORT
         if p <= long_avg * max_gap_multiple:
-            return "long"
-        return "gap"
+            return C_LONG
+        return C_GAP
 
     def pulse_confidence(p):
         gap = long_avg - short_avg
@@ -1032,17 +1047,17 @@ def decode(
         if idx >= n:
             return None, idx, 0.0
         c0 = classify(half_periods[idx])
-        if c0 == "long":
-            if idx + 1 < n and classify(half_periods[idx + 1]) == "long":
+        if c0 == C_LONG:
+            if idx + 1 < n and classify(half_periods[idx + 1]) == C_LONG:
                 p1, p2 = half_periods[idx], half_periods[idx + 1]
                 conf = (pulse_confidence(p1) + pulse_confidence(p2)) / 2
                 update_long(p1)
                 update_long(p2)
                 return 0, idx + 2, conf
             return None, idx + 1, 0.0
-        elif c0 == "short":
+        elif c0 == C_SHORT:
             if idx + 3 < n and all(
-                classify(half_periods[idx + k]) == "short" for k in (1, 2, 3)
+                classify(half_periods[idx + k]) == C_SHORT for k in (1, 2, 3)
             ):
                 ps = half_periods[idx : idx + 4]
                 conf = sum(pulse_confidence(p) for p in ps) / 4
@@ -1114,7 +1129,7 @@ def decode(
 
         elif state == "SYNCED":
             c = classify(period)
-            if c == "short":
+            if c == C_SHORT:
                 update_short(period)
                 ones_run += 1
                 i += 1
@@ -1138,7 +1153,7 @@ def decode(
                     current = bytearray()
                     current_confidences = []
                     flushed_this_run = True
-            elif c == "long":
+            elif c == C_LONG:
                 ones_run = 0
                 flushed_this_run = False
                 state = "BYTE"
@@ -1600,7 +1615,7 @@ def _t_wav_decoding():
             samples = _unpack_samples(raw, sampwidth)
             edges_gen = find_all_edges(samples, 0.2)
             half_periods_gen = edges_to_half_periods(edges_gen)
-            half_periods = list(half_periods_gen)
+            half_periods = array.array("f", half_periods_gen)
             blocks = decode(half_periods, framerate)
             if len(blocks) != 1:
                 return (
@@ -1690,7 +1705,7 @@ def _t_flac_decoding():
             samples = _unpack_samples(raw, sampwidth)
             edges_gen = find_all_edges(samples, 0.2)
             half_periods_gen = edges_to_half_periods(edges_gen)
-            half_periods = list(half_periods_gen)
+            half_periods = array.array("f", half_periods_gen)
             blocks = decode(half_periods, framerate)
             if len(blocks) != 1:
                 return (
@@ -1936,7 +1951,7 @@ def main():
     half_periods_gen = edges_to_half_periods(edges_gen)
 
     # decode() requires random access/indexing, so we consume the generator here
-    half_periods = list(half_periods_gen)
+    half_periods = array.array("f", half_periods_gen)
     print("%d half-cycles detected" % len(half_periods), file=sys.stderr)
 
     blocks = decode(
