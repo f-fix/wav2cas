@@ -207,25 +207,6 @@ def apply_band_filter(samples, framerate):
 class PurePythonFlacDecoder:
     """A pure Python FLAC decoder that streams from disk to save memory."""
 
-    _CRC8_TABLE = None
-
-    @classmethod
-    def _get_crc8_table(cls):
-        """Generate the CRC-8 table for the FLAC polynomial: x^8 + x^4 + x^3 + x^2 + 1."""
-        if cls._CRC8_TABLE is None:
-            poly = 0x07
-            table = bytearray(256)
-            for i in range(256):
-                crc = i
-                for _ in range(8):
-                    if crc & 0x80:
-                        crc = (crc << 1) ^ poly
-                    else:
-                        crc <<= 1
-                table[i] = crc & 0xFF
-            cls._CRC8_TABLE = table
-        return cls._CRC8_TABLE
-
     def __init__(self, file_path):
         self.f = open(file_path, "rb")
         self.data_len = os.path.getsize(file_path)
@@ -235,7 +216,6 @@ class PurePythonFlacDecoder:
         self.channels = 2
         self.bits_per_sample = 16
         self.total_samples = 0
-        self.samples_yielded = 0
 
         # Bit stream buffer state
         self.bit_buffer = 0
@@ -284,42 +264,38 @@ class PurePythonFlacDecoder:
 
     def stream_samples(self):
         """Generator yielding decoded 16-bit PCM samples with progress reports."""
-        table = self._get_crc8_table()
         while self.offset < self.data_len:
-            if self.samples_yielded >= self.total_samples:
-                break
             percent = min(100.0, (self.offset / self.data_len) * 100.0)
             sys.stdout.write(f"\rDecoding FLAC: {percent:5.1f}%")
             sys.stdout.flush()
 
-            # Fast search for sync byte
-            sync_byte = self.f.read(1)
-            if not sync_byte:
+            sync_marker = self._read_bytes(2)
+            if not sync_marker:
                 break
-            self.offset += 1
 
-            if sync_byte[0] == 0xFF:
-                next_byte = self.f.read(1)
-                if not next_byte:
-                    break
-                self.offset += 1
-                if (next_byte[0] & 0xFE) == 0xF8:
-                    # Potential frame. Validate Header CRC-8 to avoid False Syncs.
-                    start_pos = self.f.tell() - 2
-                    try:
-                        self.bit_buffer = self.bit_count = 0
-                        yield from self._parse_frame(next_byte[0], table)
-                    except (EOFError, ValueError, IndexError):
-                        # Rejection: go back and slide forward by one byte
-                        self.f.seek(start_pos + 1)
-                        self.offset = start_pos + 1
-                else:
-                    self.f.seek(-1, os.SEEK_CUR)
-                    self.offset -= 1
+            # Check for sync code (14 bits set to 1 -> 0xFFF)
+            if (
+                len(sync_marker) == 2
+                and sync_marker[0] == 0xFF
+                and (sync_marker[1] & 0xFC) == 0xF8
+            ):
+                self.f.seek(-2, os.SEEK_CUR)
+                self.offset -= 2
+                try:
+                    yield from self._parse_frame()
+                except (ValueError, IndexError, struct.error, EOFError):
+                    # Skip the sync and search again if a frame is corrupt
+                    self.f.seek(2, os.SEEK_CUR)
+                    self.offset += 2
+            else:
+                self.f.seek(-1, os.SEEK_CUR)
+                self.offset -= 1
 
-    def _read_vlc(self, header_bytes=None):
+    def _read_utf8(self):
         """Read variable-length frame/sample number from bitstream."""
-        v = self._read_bits(8, header_bytes)
+        v = self._read_bits(8)
+        if v is None:
+            return 0
         if v < 0x80:
             return v
         elif 0xC0 <= v <= 0xDF:
@@ -335,193 +311,271 @@ class PurePythonFlacDecoder:
         else:
             return 0
         for _ in range(n):
-            val = (val << 6) | (self._read_bits(8, header_bytes) & 0x3F)
+            val = (val << 6) | (self._read_bits(8) & 0x3F)
         return val
 
-    def _parse_frame(self, b2, table):
-        header_bytes = bytearray([0xFF, b2])
+    def _parse_frame(self):
+        self.bit_count = 0
+        self.bit_buffer = 0
 
-        # Bits: Res(1), Blocking(1) were in b2.
-        # Next: BlockSize(4), SampleRate(4)
-        b3 = self._read_bits(8, header_bytes)
-        bs_code, sr_code = (b3 >> 4), (b3 & 0x0F)
+        # Read Header Fields
+        self._read_bits(14)  # sync
+        self._read_bits(1)  # reserved
+        self._read_bits(1)  # blocking strategy
 
-        # Next: ChAssignment(4), BPS(3), Res(1)
-        b4 = self._read_bits(8, header_bytes)
-        ch_assignment = (b4 >> 4) & 0x0F
+        bs_code = self._read_bits(4)
+        sr_code = self._read_bits(4)
+        ch_assignment = self._read_bits(4)
+        self._read_bits(3)  # sample size code
+        self._read_bits(1)  # reserved
 
-        # Frame/Sample number
-        self._read_vlc(header_bytes)
+        # Read variable-length frame/sample number
+        self._read_utf8()
 
-        # Block Size Extra bytes
+        # Resolve block size
         if bs_code == 1:
             block_size = 192
         elif 2 <= bs_code <= 5:
             block_size = 576 << (bs_code - 2)
         elif bs_code == 6:
-            block_size = self._read_bits(8, header_bytes) + 1
+            block_size = self._read_bits(8) + 1
         elif bs_code == 7:
-            block_size = self._read_bits(16, header_bytes) + 1
+            block_size = self._read_bits(16) + 1
         elif 8 <= bs_code <= 15:
             block_size = 256 << (bs_code - 8)
         else:
-            raise ValueError("Invalid block size code")
+            return
 
-        # Sample Rate Extra bytes
+        # Resolve sample rate extra bytes
         if sr_code == 12:
-            self._read_bits(8, header_bytes)
+            self._read_bits(8)
         elif sr_code in (13, 14):
-            self._read_bits(16, header_bytes)
+            self._read_bits(16)
 
-        # Validate Header CRC-8
-        actual_crc = self._read_bits(8)
-        calc_crc = 0
-        for b in header_bytes:
-            calc_crc = table[calc_crc ^ b]
-        if calc_crc != actual_crc:
-            raise ValueError("CRC-8 mismatch: false sync rejected")
+        self._read_bits(8)  # Skip CRC-8 header byte
 
         subframe_samples = []
         for ch in range(self.channels):
-            # Side channels have bps + 1 bit precision
-            bps = self.bits_per_sample
+            # RFC 9639: Side channels in decorrelated states have bps + 1
+            cur_bps = self.bits_per_sample
             if (
                 (ch_assignment == 8 and ch == 1)
                 or (ch_assignment == 9 and ch == 0)
                 or (ch_assignment == 10 and ch == 1)
             ):
-                bps += 1
-            sub_samples = self._parse_subframe(block_size, bps)
+                cur_bps += 1
+            sub_samples = self._parse_subframe(block_size, cur_bps)
             subframe_samples.append(sub_samples)
 
-        if self.channels == 2:
-            l, r = subframe_samples[0], subframe_samples[1]
-            if ch_assignment == 8:  # Left/Side: R = L - S
+        # Apply Channel Decorrelation (RFC 9639 bit-exact)
+        if self.channels == 2 and len(subframe_samples) == 2:
+            left, right = subframe_samples[0], subframe_samples[1]
+            if ch_assignment == 8:  # Left/Side -> R = L - S
                 for i in range(block_size):
-                    r[i] = l[i] - r[i]
-            elif ch_assignment == 9:  # Side/Right: L = S + R
+                    right[i] = left[i] - right[i]
+            elif ch_assignment == 9:  # Side/Right -> L = R + S
                 for i in range(block_size):
-                    l[i] += r[i]
-            elif ch_assignment == 10:  # Mid/Side Reconstruction
+                    left[i] = left[i] + right[i]
+            elif ch_assignment == 10:  # Mid/Side
                 for i in range(block_size):
-                    m, s = l[i], r[i]
-                    l[i] = m + ((s + (s & 1)) >> 1)
-                    r[i] = m - (s >> 1)
+                    mid, side = left[i], right[i]
+                    left[i] = mid + (side >> 1)
+                    if side & 1:
+                        left[i] += 1
+                    right[i] = left[i] - side
+            subframe_samples = [left, right]
 
         for i in range(block_size):
-            if self.samples_yielded >= self.total_samples:
-                break
             for ch in range(self.channels):
-                v = subframe_samples[ch][i]
-                if self.bits_per_sample > 16:
-                    v >>= self.bits_per_sample - 16
-                elif self.bits_per_sample < 16:
-                    v <<= 16 - self.bits_per_sample
-                yield max(-32768, min(32767, v))
-            self.samples_yielded += 1
+                if i < len(subframe_samples[ch]):
+                    sample = subframe_samples[ch][i]
+
+                    if self.bits_per_sample > 16:
+                        sample >>= self.bits_per_sample - 16
+                    elif self.bits_per_sample < 16:
+                        sample <<= 16 - self.bits_per_sample
+
+                    sample = max(-32768, min(32767, sample))
+                    yield sample
+
+    def _get_block_size(self, bs_type):
+        if bs_type == 1:
+            return 192
+        elif 2 <= bs_type <= 5:
+            return 576 << (bs_type - 2)
+        elif bs_type == 6:
+            b = self._read_bytes(1)
+            return (b[0] + 1) if b else None
+        elif bs_type == 7:
+            b = self._read_bytes(2)
+            return (struct.unpack(">H", b)[0] + 1) if b else None
+        elif 8 <= bs_type <= 15:
+            return 256 << (bs_type - 8)
+        return None
 
     def _parse_subframe(self, block_size, bps):
         sub_header = self._read_bits(8)
-        stype = (sub_header >> 1) & 0x3F
+        if sub_header is None:
+            return [0] * block_size
+
+        sub_type = (sub_header >> 1) & 0x3F
+
         wasted_bits = 0
         if (sub_header & 0x01) != 0:
             wasted_bits = self._read_unary() + 1
+            if wasted_bits >= bps:
+                wasted_bits = 0  # Safety cap
 
-        bps_eff = bps - wasted_bits
         samples = [0] * block_size
+        bps_eff = bps - wasted_bits
 
-        if stype == 0:  # Constant
+        if sub_type == 0:
             sample = self._read_signed_bits(bps_eff)
             samples = [sample] * block_size
-        elif stype == 1:  # Verbatim
+        elif sub_type == 1:
             for i in range(block_size):
                 samples[i] = self._read_signed_bits(bps_eff)
-        elif 8 <= stype <= 12:  # Fixed
-            order = stype - 8
+        elif 8 <= sub_type <= 12:
+            order = sub_type - 8
             for i in range(order):
                 samples[i] = self._read_signed_bits(bps_eff)
-            self._parse_residual(block_size, order, samples)
-            for i in range(order, block_size):
-                if order == 1:
+
+            samples = self._parse_residual(block_size, order, samples)
+
+            # Apply Fixed predictors
+            if order == 1:
+                for i in range(1, block_size):
                     samples[i] += samples[i - 1]
-                elif order == 2:
+            elif order == 2:
+                for i in range(2, block_size):
                     samples[i] += 2 * samples[i - 1] - samples[i - 2]
-                elif order == 3:
+            elif order == 3:
+                for i in range(3, block_size):
                     samples[i] += (
                         3 * samples[i - 1] - 3 * samples[i - 2] + samples[i - 3]
                     )
-                elif order == 4:
+            elif order == 4:
+                for i in range(4, block_size):
                     samples[i] += (
                         4 * samples[i - 1]
                         - 6 * samples[i - 2]
                         + 4 * samples[i - 3]
                         - samples[i - 4]
                     )
-        elif 32 <= stype <= 63:  # LPC
-            order = stype - 31
+
+        elif 32 <= sub_type <= 63:
+            order = sub_type - 31
             for i in range(order):
                 samples[i] = self._read_signed_bits(bps_eff)
-            prec, shift = self._read_bits(4) + 1, self._read_signed_bits(5)
+
+            prec = self._read_bits(4) + 1
+            shift = self._read_signed_bits(5)
             coeffs = [self._read_signed_bits(prec) for _ in range(order)]
-            self._parse_residual(block_size, order, samples)
+
+            samples = self._parse_residual(block_size, order, samples)
+
+            # Apply LPC predictors
             for i in range(order, block_size):
-                samples[i] += (
-                    sum(c * samples[i - 1 - j] for j, c in enumerate(coeffs)) >> shift
-                )
+                pred = sum(coeffs[j] * samples[i - 1 - j] for j in range(order))
+                samples[i] += pred >> shift
 
         if wasted_bits > 0:
-            for i in range(block_size):
-                samples[i] <<= wasted_bits
+            samples = [s << wasted_bits for s in samples]
+
         return samples
 
     def _parse_residual(self, block_size, order, samples):
-        method = self._read_bits(2)
-        p_order = self._read_bits(4)
-        num_partitions = 1 << p_order
-        p_len = block_size >> p_order
+        rice_header = self._read_bits(2)
+        if rice_header is None:
+            return samples
+
+        param_len = 4 if rice_header == 0 else 5
+        partition_order = self._read_bits(4)
+        num_partitions = 1 << partition_order
+        part_samples = block_size >> partition_order
+
         idx = order
         for p in range(num_partitions):
-            param = self._read_bits(4 if method == 0 else 5)
-            for _ in range(p_len - (order if p == 0 else 0)):
-                samples[idx] = self._read_rice_signed(param)
+            param = self._read_bits(param_len)
+            if param is None:
+                break
+
+            escape = (1 << param_len) - 1
+
+            if param == escape:
+                bps_res = self._read_bits(5)
+            else:
+                bps_res = 0
+
+            samples_in_partition = part_samples if p > 0 else part_samples - order
+
+            for _ in range(samples_in_partition):
+                if idx >= block_size:
+                    break
+
+                if param == escape:
+                    val = self._read_signed_bits(bps_res) if bps_res > 0 else 0
+                else:
+                    val = self._read_rice_signed(param)
+
+                samples[idx] = val
                 idx += 1
 
-    def _read_bits(self, n, header_bytes=None):
+        return samples
+
+    def _read_bits(self, n):
         if n == 0:
             return 0
         while self.bit_count < n:
             b = self.f.read(1)
             if not b:
-                raise EOFError()
-            byte_val = b[0]
-            if header_bytes is not None:
-                header_bytes.append(byte_val)
-            self.bit_buffer = (self.bit_buffer << 8) | byte_val
+                raise EOFError("Unexpected end of file")
+            self.bit_buffer = (self.bit_buffer << 8) | b[0]
             self.bit_count += 8
             self.offset += 1
+
         self.bit_count -= n
         res = (self.bit_buffer >> self.bit_count) & ((1 << n) - 1)
-        self.bit_buffer &= (1 << self.bit_count) - 1
+        self.bit_buffer &= (
+            1 << self.bit_count
+        ) - 1  # Prevent integer explosion (OOM fix)
         return res
 
     def _read_signed_bits(self, n):
-        v = self._read_bits(n)
-        return v if not (v & (1 << (n - 1))) else v - (1 << n)
+        if n == 0:
+            return 0
+        unsigned_val = self._read_bits(n)
+        if unsigned_val is None:
+            return 0
+        if unsigned_val & (1 << (n - 1)):
+            unsigned_val -= 1 << n
+        return unsigned_val
 
     def _read_unary(self):
         count = 0
-        while not self._read_bits(1):
+        while True:
+            bit = self._read_bits(1)
+            if bit is None or bit == 1:
+                break
             count += 1
-            if count > 512:
-                raise ValueError("Unary malformed")
+            if count > 1024:
+                raise ValueError("Malformed Unary code")  # OOM Safety
         return count
 
     def _read_rice_signed(self, param):
-        u = self._read_unary()
-        val = (u << param) | self._read_bits(param)
-        return (val >> 1) ^ -(val & 1)
+        val = self._read_unary()
+        if param > 0:
+            low = self._read_bits(param)
+            if low is not None:
+                val = (val << param) | low
+        # Zig-zag decoding: val/2 if even, -(val+1)/2 if odd
+        if val & 1:
+            return -((val >> 1) + 1)
+        else:
+            return val >> 1
 
     def close(self):
+        # Ensure the final progress line is cleared and completion is noted.
         sys.stdout.write("\rDecoding FLAC: 100.0% - Complete!\n")
         sys.stdout.flush()
         self.f.close()
@@ -560,6 +614,8 @@ class FlacStreamReader:
                 arr.append(next(self.sample_gen))
             except StopIteration:
                 break
+        if not arr:
+            return b""
         if sys.byteorder != "little":
             arr.byteswap()
         return arr.tobytes()
