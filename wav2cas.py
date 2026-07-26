@@ -422,13 +422,49 @@ class PurePythonFlacDecoder:
             order = sub_type - 8
             for i in range(order):
                 samples[i] = self._read_signed_bits(self.bits_per_sample)
+
             samples = self._parse_residual(block_size, order, samples)
+
+            # Apply Fixed predictors
+            if order == 1:
+                for i in range(order, block_size):
+                    samples[i] += samples[i - 1]
+            elif order == 2:
+                for i in range(order, block_size):
+                    samples[i] += 2 * samples[i - 1] - samples[i - 2]
+            elif order == 3:
+                for i in range(order, block_size):
+                    samples[i] += (
+                        3 * samples[i - 1] - 3 * samples[i - 2] + samples[i - 3]
+                    )
+            elif order == 4:
+                for i in range(order, block_size):
+                    samples[i] += (
+                        4 * samples[i - 1]
+                        - 6 * samples[i - 2]
+                        + 4 * samples[i - 3]
+                        - samples[i - 4]
+                    )
+
         elif 32 <= sub_type <= 63:
             order = sub_type - 31
             for i in range(order):
                 samples[i] = self._read_signed_bits(self.bits_per_sample)
-            self._read_bytes(4)
+
+            # Properly read LPC header: precision (4 bits), shift (5 bits signed), and coefficients
+            prec = self._read_bits(4) + 1
+            shift = self._read_signed_bits(5)
+            coeffs = [self._read_signed_bits(prec) for _ in range(order)]
+
             samples = self._parse_residual(block_size, order, samples)
+
+            # Apply LPC predictors
+            for i in range(order, block_size):
+                pred = sum(coeffs[j] * samples[i - 1 - j] for j in range(order))
+                if shift >= 0:
+                    samples[i] += pred >> shift
+                else:
+                    samples[i] += pred << (-shift)
 
         if wasted_bits > 0:
             samples = [s << wasted_bits for s in samples]
@@ -445,22 +481,34 @@ class PurePythonFlacDecoder:
         num_partitions = 1 << partition_order
         part_samples = block_size >> partition_order
 
+        idx = order
         for p in range(num_partitions):
             param = self._read_bits(param_len)
             if param is None:
                 break
 
             escape = (1 << param_len) - 1
-            start_idx = order if p == 0 else 0
-            end_idx = part_samples
 
-            for i in range(start_idx, end_idx):
-                idx = p * part_samples + i
+            # Handle unencoded binary residual payload
+            if param == escape:
+                bps = self._read_bits(5)
+            else:
+                bps = 0
+
+            # Partition 0 is short by `order` samples
+            samples_in_partition = part_samples if p > 0 else part_samples - order
+
+            for _ in range(samples_in_partition):
                 if idx >= block_size:
                     break
-                val = self._read_rice_signed(param if param < escape else 0)
-                prev_val = samples[idx - 1] if idx > 0 else 0
-                samples[idx] = val + prev_val
+
+                if param == escape:
+                    val = self._read_signed_bits(bps) if bps > 0 else 0
+                else:
+                    val = self._read_rice_signed(param)
+
+                samples[idx] = val
+                idx += 1
 
         return samples
 
@@ -478,6 +526,8 @@ class PurePythonFlacDecoder:
         return (self.bit_buffer >> self.bit_count) & ((1 << n) - 1)
 
     def _read_signed_bits(self, n):
+        if n == 0:
+            return 0
         unsigned_val = self._read_bits(n)
         if unsigned_val is None:
             return 0
