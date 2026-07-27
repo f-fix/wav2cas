@@ -139,7 +139,10 @@ class CMTAudioOutputFilterExact:
         Processes a streaming chunk of float audio samples (-1.0 to +1.0).
         """
         # 1. Logic Inverter (74LS14)
-        inverted = -chunk
+        if len(chunk) > 0 and np.min(chunk) >= 0.0:
+            inverted = 1.0 - chunk
+        else:
+            inverted = -chunk
 
         # 2. Linear continuous circuit (AC coupling, LP smoothing, attenuation),
         #    normalized so the circuit's true electrical peak maps to +/-1.0.
@@ -199,6 +202,20 @@ class CMTAudioInputFilterExact:
         return output
 
 
+class CMTAudioTTLFilter:
+    """
+    Models TTL logic level shaping (0.0 V logic low, 1.0 V / 5V logic high).
+    Converts comparator outputs (-1.0 / +1.0) or thresholded audio into
+    0.0 / 1.0 TTL logic level representation.
+    """
+
+    def __init__(self, threshold=0.0):
+        self.threshold = threshold
+
+    def process_chunk(self, chunk: np.ndarray) -> np.ndarray:
+        return np.where(chunk > self.threshold, 1.0, 0.0).astype(np.float32)
+
+
 class TapeChannelGain:
     """
     OPTIONAL stage modeling real-world tape recording/playback level loss
@@ -226,7 +243,7 @@ class TapeChannelGain:
 def _build_filter_chain(mode_spec, sample_rate, tape_gain_db=None):
     """
     Builds a list of (name, filter_obj) stages from a mode spec like
-    'output', 'input', 'output+input', or 'output,input'.
+    'output', 'input', 'ttl', 'input+ttl+output', or 'output,input'.
     If tape_gain_db is given, a TapeChannelGain stage is inserted right after
     each 'output' stage to model tape recording/playback level loss or gain
     (see TapeChannelGain docstring). By default (tape_gain_db=None) no such
@@ -237,13 +254,17 @@ def _build_filter_chain(mode_spec, sample_rate, tape_gain_db=None):
         m.strip().lower() for m in mode_spec.replace("+", ",").split(",") if m.strip()
     ]
     for m in modes:
-        if m not in ("input", "output"):
-            raise ValueError(f"Unknown mode '{m}' (expected 'input' or 'output')")
+        if m not in ("input", "output", "ttl"):
+            raise ValueError(
+                f"Unknown mode '{m}' (expected 'input', 'output', or 'ttl')"
+            )
 
     stages = []
     for m in modes:
         if m == "input":
             stages.append(("input", CMTAudioInputFilterExact(sample_rate=sample_rate)))
+        elif m == "ttl":
+            stages.append(("ttl", CMTAudioTTLFilter()))
         else:
             stages.append(
                 ("output", CMTAudioOutputFilterExact(sample_rate=sample_rate))
@@ -343,6 +364,12 @@ class TestCMTAudioFiltersExact(unittest.TestCase):
         self.assertLess(np.max(np.abs(settled_1k)), 1.0)
         self.assertGreater(np.max(np.abs(settled_1k)), 0.9)
 
+    def test_ttl_filter(self):
+        ttl_filt = CMTAudioTTLFilter()
+        chunk = np.array([-1.0, 0.5, -0.2, 0.8], dtype=np.float32)
+        out = ttl_filt.process_chunk(chunk)
+        self.assertTrue(np.array_equal(out, [0.0, 1.0, 0.0, 1.0]))
+
     def test_input_filter_reconstruction(self):
         fs = 44100
         in_filter = CMTAudioInputFilterExact(sample_rate=fs)
@@ -428,8 +455,8 @@ def main():
     parser.add_argument(
         "-m",
         "--mode",
-        help="Filter mode: 'input' (CMT-IN -> IOA7), 'output' (PC5 -> CMT OUT), "
-        "or a chain such as 'output+input' / 'output,input' to simulate a full "
+        help="Filter mode: 'input' (CMT-IN -> IOA7), 'output' (PC5 -> CMT OUT), 'ttl' (PPI TTL logic level), "
+        "or a chain such as 'input+ttl+output' / 'output+input' to simulate a full "
         "record->playback round trip through a cassette deck.",
     )
     parser.add_argument("-i", "--input-file", help="Path to input WAV file")
