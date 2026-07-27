@@ -116,8 +116,25 @@ Converts MSX CAS to WAV. Generates 22050 Hz monaural 16-bit signed linear PCM wi
 
 ### Usage
 
-```bash
-python cas2wav.py input.cas output.wav
+```
+cas2wav.py [-h] [--test] [input] [output]
+input and output are required (unless --test is given)
+```
+
+### Output of `--help`
+
+```
+usage: cas2wav.py [-h] [--test] [input] [output]
+
+Convert MSX .CAS cassette file to .WAV audio.
+
+positional arguments:
+  input       input .cas file
+  output      output .wav file
+
+options:
+  -h, --help  show this help message and exit
+  --test      run internal self-tests and exit
 ```
 
 ## flac2wav
