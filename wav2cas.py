@@ -66,7 +66,7 @@ FORMAT ASSUMPTIONS (standard MSX BIOS cassette encoding, FSK / Kansas-City style
     the average over the start bit, the 8 data bits, and (in strict mode)
     the stop bit(s). Per-block confidence is the average of its bytes'
     confidences. Block confidence is printed as a diagnostic, and blocks
-    scoring below --min-confidence (default 0.8) are
+    scoring below --min-confidence (default 0.75) are
     left out of the output file - useful for automatically discarding
     spurious blocks decoded from a garbled/noisy stretch of tape.
 
@@ -1851,8 +1851,8 @@ def main():
     parser.add_argument(
         "--min-confidence",
         type=float,
-        default=0.8,
-        help="minimum block confidence threshold (default: 0.8)",
+        default=0.75,
+        help="minimum block confidence threshold (default: 0.75)",
     )
     parser.add_argument(
         "--no-edge-trim",
