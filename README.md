@@ -1,6 +1,6 @@
-# wav2cas, cas2wav, flac2wav, cmt_filter
+# wav2cas, cas2wav, flac2wav, cmt_filter, cassette_model
 
-decode MSX and MSX-like cassette audio from WAV/FLAC files into CAS format; also encode CAS to WAV; also decode FLAC to WAV
+decode MSX and MSX-like cassette audio from WAV/FLAC files into CAS format; also encode CAS to WAV; also decode FLAC to WAV; also simulate CMT input/output audio effects and cassette tape audio effects
 
 ## wav2cas
 decode MSX and MSX-like cassette audio from WAV files into CAS format
@@ -264,6 +264,30 @@ Component & Circuit Effects:
 
 - Combined Exact Transfer Function H_out(s):
   H_out(s) = (C31 * R39 * s) / [ (C31 * C32 * R41 * (R39 + R40)) * s^2 + (C31*(R39+R40+R41) + C32*(R39+R40)) * s + 1 ]
+```
+
+## cassette_model
+
+simulate cassette tape audio effects
+
+### Output of `--help`
+
+```
+usage: cassette_model.py [-h] [-i INPUT] [-o OUTPUT] [-m MODE] [--drive DRIVE]
+                         [--hiss HISS] [--test]
+
+Audio Cassette Modeler with Explicit Filter Chaining (+)
+
+options:
+  -h, --help           show this help message and exit
+  -i, --input INPUT    Path to input WAV file
+  -o, --output OUTPUT  Path to output WAV file
+  -m, --mode MODE      Filter sequence separated by '+' (e.g.,
+                       'record+playback', 'playback+record',
+                       'record+playback+record+playback')
+  --drive DRIVE        Tape saturation drive intensity (default: 1.2)
+  --hiss HISS          Tape hiss noise level (default: 0.001)
+  --test               Run embedded unit test suite
 ```
 
 # Note on the code and the tools used to write it
