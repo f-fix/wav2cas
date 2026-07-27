@@ -288,12 +288,18 @@ class PurePythonFlacDecoder:
     def stream_samples(self):
         """Generator yielding decoded 16-bit PCM samples with progress reports."""
         table = self._get_crc8_table()
+        last_reported_decasec = 0  # omit the first report
         while self.offset < self.data_len:
             if self.samples_yielded >= self.total_samples:
                 break
-            percent = min(100.0, (self.offset / self.data_len) * 100.0)
-            sys.stdout.write(f"\rDecoding FLAC: {percent:5.1f}%")
-            sys.stdout.flush()
+
+            # Print progress at most once per 10 seconds of processed audio
+            current_audio_decasec = int(self.samples_yielded / self.sample_rate / 10)
+            if current_audio_decasec > last_reported_decasec:
+                percent = min(100.0, (self.offset / self.data_len) * 100.0)
+                sys.stdout.write(f"\rDecoding FLAC: {percent:5.1f}%")
+                sys.stdout.flush()
+                last_reported_decasec = current_audio_decasec
 
             # Fast search for sync byte
             sync_byte = self.f.read(1)
