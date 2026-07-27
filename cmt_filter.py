@@ -243,9 +243,7 @@ def _build_filter_chain(mode_spec, sample_rate, tape_gain_db=None):
     stages = []
     for m in modes:
         if m == "input":
-            stages.append(
-                ("input", CMTAudioInputFilterExact(sample_rate=sample_rate))
-            )
+            stages.append(("input", CMTAudioInputFilterExact(sample_rate=sample_rate)))
         else:
             stages.append(
                 ("output", CMTAudioOutputFilterExact(sample_rate=sample_rate))
@@ -485,9 +483,7 @@ def main():
         sys.exit(1)
 
     stage_desc = " -> ".join(name for name, _ in stages)
-    print(
-        f"Applying CMT Audio filter chain [{stage_desc}] on '{args.input_file}'..."
-    )
+    print(f"Applying CMT Audio filter chain [{stage_desc}] on '{args.input_file}'...")
     filter_obj = ChainedFilter(stages)
 
     process_wav_file(
