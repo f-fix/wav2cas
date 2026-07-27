@@ -19,8 +19,11 @@ class PurePythonFlacDecoder:
 
     @classmethod
     def _get_crc8_table(cls):
-        """Generate the CRC-8 table for the FLAC polynomial: x^8 + x^4 + x^3 + x^2 + 1."""
+        """Memoized computation of the CRC-8 table as a bytearray."""
         if cls._CRC8_TABLE is None:
+            # FLAC frame header CRC-8 table.
+            # Polynomial: x^8 + x^4 + x^3 + x^2 + 1 (0x07).
+            # This polynomial is defined in the FLAC specification (RFC 9639).
             poly = 0x07
             table = bytearray(256)
             for i in range(256):
@@ -221,11 +224,16 @@ class PurePythonFlacDecoder:
                 break
             for ch in range(self.channels):
                 v = subframe_samples[ch][i]
+
+                # High-quality bit-depth reduction (matches Sox -D rounding)
                 if self.bits_per_sample > 16:
-                    v >>= self.bits_per_sample - 16
+                    shift = self.bits_per_sample - 16
+                    v = (v + (1 << (shift - 1))) >> shift
                 elif self.bits_per_sample < 16:
                     v <<= 16 - self.bits_per_sample
-                yield max(-32768, min(32767, v))
+
+                sample = max(-32768, min(32767, v))
+                yield sample
             self.samples_yielded += 1
 
     def _parse_subframe(self, block_size, bps):
@@ -361,6 +369,8 @@ class FlacStreamReader:
                 arr.append(next(self.sample_gen))
             except StopIteration:
                 break
+        if not arr:
+            return b""
         if sys.byteorder != "little":
             arr.byteswap()
         return arr.tobytes()
