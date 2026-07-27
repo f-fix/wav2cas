@@ -96,17 +96,26 @@ def cas_to_wav(cas_filename, wav_filename):
     pcm_frames = []
     idx = 0
     total_bytes = len(cas_data)
-    is_first_header = True
+    prev_leader_was_long = None
+    current_block_bytes = 0
     while idx < total_bytes:
         if cas_data[idx : idx + 8] == CAS_HEADER_MARKER:
+            if prev_leader_was_long is None:
+                leader_is_long = True
+            elif prev_leader_was_long and current_block_bytes == 16:
+                leader_is_long = False
+            else:
+                leader_is_long = True
             leader_duration = (
-                FIRST_LEADER_DURATION if is_first_header else NORMAL_LEADER_DURATION
+                FIRST_LEADER_DURATION if leader_is_long else NORMAL_LEADER_DURATION
             )
             pcm_frames.extend(generate_pilot_leader(leader_duration))
-            is_first_header = False
+            prev_leader_was_long = leader_is_long
+            current_block_bytes = 0
             idx += 8
         else:
             pcm_frames.extend(encode_byte(cas_data[idx]))
+            current_block_bytes += 1
             idx += 1
     pcm_frames.extend(generate_silence(FINAL_SILENCE_DURATION))
     with wave.open(wav_filename, "wb") as wav_file:  # NOSONAR
@@ -118,13 +127,14 @@ def cas_to_wav(cas_filename, wav_filename):
 
 
 def run_self_tests():
+    # test 1: single-block encoding
     # this WAV was generated and encoded by:
     # ```bash
     # LC_ALL=C printf '\x1f\xa6\xde\xba\xcc\x13\x7d\x74%s' TEST > test.cas &&
     #     python3 cas2wav.py test.cas test.wav &&
     #     lzma -9 < test.wav | recode l1..l1/b64
     # ```
-    expected_wav = lzma.decompress(
+    expected_wav_single = lzma.decompress(
         base64.b64decode(
             "XQAAAAT//////////wApEkTrmN6NWD9/VTXn4ecOY4FtT/55rcJhTYtnpJCd4o6aYb7RT"
             "0LxXkXneXkXdZsVx3Y2qc66oczkz6UyaM5IWk9BKZhm+OBqFKV+D0txo48GT9zniR2UxYD"
@@ -133,18 +143,75 @@ def run_self_tests():
             "Fmv+0q7rxZUVprFnw7oIUs4qv23CaO2eTG1kOfZXK9Ut/G41lfBUEe+4JokA=="
         )
     )
+
+    # test 2: multi-block pilot leader durations (heuristic rules)
+    # this WAV was generated and encoded by:
+    # ```bash
+    # H='\x1f\xa6\xde\xba\xcc\x13\x7d\x74'
+    # LC_ALL=C printf "${H}%s${H}%s${H}%s${H}%s" \
+    #     0123456789ABCDEF 0123456789ABCDEF 0123456789 END > test.cas && \
+    #     python3 cas2wav.py test.cas test.wav && \
+    #     lzma -9 < test.wav | recode l1..l1/b64
+    # ```
+    expected_wav_multi = lzma.decompress(
+        base64.b64decode(
+            "XQAAAAT//////////wApEkTrg2pYp1otM4++17Ni59xlSAUj4kIUE3DoTXXVbjMnQd7g0Fp4tYmu"
+            "W2NfMBkAmb9nPzpDO+W4mZoiV9/R5kXhwi8hzB50Vi0PH1P8tdvtpNsg2pa5ufCxV+V5gHeYNbBt"
+            "LHp9orM4cpCWqK6KNRHNYvTIUg1gN8pZY88LvFvjB28BL2BhwsxiECybrXnNSZnA29uwcDXP25cb"
+            "3+gaLlz4Dr1aWBODNbCzyIwC8XEauHVYQbTwIT0o152FXA1RiFjTFaHNke3I6BCTSlnKpMGHsdjD"
+            "cz4B0vIBUgX3TgJlIclnRfyblYTHgCxpUJkaqjbw/m/JN21RUDCs4dr2faq9+KZiI85YzHc211rV"
+            "CPluGbP1j8S6Dg3ktBpZKvpJ7TPAg3GyAmdIKq1Uw+bed61GvzP/hHHeCbvuMJLaIdVd2KHSfp1y"
+            "d229LtMKtnCujq2sL6u42wRV3FGjWVUZx+6IEnfMKHnr7kyH4FgrxV5Roue71Xjl9AF92TTxEbkM"
+            "wdIfMTlrJIGii1z2q+aEHzsVCSxJ6qC2JfVxaaUR9sWCL+L2GKI9kTw3cboDPUvn4ABd68ptiDMv"
+            "DTVJyysvrYvnu9V45fQBfdydwAaYTZLIcvLt5vBayrXPsSYTGO5DefMI7IHjg8SQrsn7Ak7bf9C2"
+            "rhv8nrqBDHHPKG4dPMbD+QMlfHryr3sd"
+        )
+    )
+
+    passed = failed = 0
+
     with tempfile.TemporaryDirectory() as tmpdir:
-        cas_path = os.path.join(tmpdir, "test.cas")
-        wav_path = os.path.join(tmpdir, "test.wav")
+        cas_path = os.path.join(tmpdir, "test1.cas")
+        wav_path = os.path.join(tmpdir, "test1.wav")
         with open(cas_path, "wb") as f:
             f.write(CAS_HEADER_MARKER + b"TEST")
         cas_to_wav(cas_path, wav_path)
         with open(wav_path, "rb") as f:
-            generated_wav = f.read()
-    ok = generated_wav == expected_wav
-    print("[%s] WAV encoding" % ("PASS" if ok else "FAIL"))
-    print("%d passed, %d failed" % (1 if ok else 0, 0 if ok else 1))
-    return ok
+            gen1 = f.read()
+    ok1 = gen1 == expected_wav_single
+    print("[%s] WAV encoding (single-block)" % ("PASS" if ok1 else "FAIL"))
+    if ok1:
+        passed += 1
+    else:
+        failed += 1
+
+    multi_cas = (
+        CAS_HEADER_MARKER
+        + b"0123456789ABCDEF"
+        + CAS_HEADER_MARKER
+        + b"0123456789ABCDEF"
+        + CAS_HEADER_MARKER
+        + b"0123456789"
+        + CAS_HEADER_MARKER
+        + b"END"
+    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cas_path = os.path.join(tmpdir, "test2.cas")
+        wav_path = os.path.join(tmpdir, "test2.wav")
+        with open(cas_path, "wb") as f:
+            f.write(multi_cas)
+        cas_to_wav(cas_path, wav_path)
+        with open(wav_path, "rb") as f:
+            gen2 = f.read()
+    ok2 = gen2 == expected_wav_multi
+    print("[%s] WAV encoding (multi-block pilot leaders)" % ("PASS" if ok2 else "FAIL"))
+    if ok2:
+        passed += 1
+    else:
+        failed += 1
+
+    print("%d passed, %d failed" % (passed, failed))
+    return failed == 0
 
 
 def main():
