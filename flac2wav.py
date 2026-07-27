@@ -4,6 +4,7 @@
 import argparse
 import array
 import base64
+import io
 import lzma
 import os
 import struct
@@ -12,8 +13,206 @@ import tempfile
 import wave
 
 
+class SeekableStreamWrapper:
+    """Wraps an unseekable binary stream to allow backward seeking over a sliding window."""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.buf = bytearray()
+        self.base_offset = 0  # stream position corresponding to buf[0]
+        self.pos = 0  # logical absolute position
+
+    def read(self, n=-1):
+        if n == 0:
+            return b""
+
+        if n < 0:
+            chunk = self.stream.read()
+            if chunk:
+                self.buf.extend(chunk)
+            res = bytes(self.buf[self.pos - self.base_offset :])
+            self.pos = self.base_offset + len(self.buf)
+            return res
+
+        target_end = self.pos + n
+        buf_end = self.base_offset + len(self.buf)
+        if target_end > buf_end:
+            needed = target_end - buf_end
+            chunk = self.stream.read(needed)
+            if chunk:
+                self.buf.extend(chunk)
+
+        start_idx = self.pos - self.base_offset
+        end_idx = min(len(self.buf), self.pos + n - self.base_offset)
+        if start_idx >= len(self.buf):
+            return b""
+
+        res = bytes(self.buf[start_idx:end_idx])
+        self.pos += len(res)
+
+        # Periodic buffer trimming to save memory
+        if self.pos - self.base_offset > 131072:
+            trim = (self.pos - self.base_offset) - 65536
+            self.buf = self.buf[trim:]
+            self.base_offset += trim
+
+        return res
+
+    def seek(self, offset, whence=os.SEEK_SET):
+        if whence == os.SEEK_SET:
+            new_pos = offset
+        elif whence == os.SEEK_CUR:
+            new_pos = self.pos + offset
+        elif whence == os.SEEK_END:
+            self.read(-1)
+            new_pos = self.base_offset + len(self.buf) + offset
+        else:
+            raise ValueError(f"Invalid whence: {whence}")
+
+        if new_pos < self.base_offset:
+            raise OSError("Cannot seek back beyond buffer window")
+        self.pos = new_pos
+        return self.pos
+
+    def tell(self):
+        return self.pos
+
+    def seekable(self):
+        return True
+
+    def close(self):
+        if hasattr(self.stream, "close") and self.stream not in (
+            sys.stdin,
+            sys.stdin.buffer,
+        ):
+            try:
+                self.stream.close()
+            except Exception:
+                pass
+
+
+class StreamingWavWriter:
+    """
+    WAV file writer supporting seekable files and unseekable streams (like stdout / '-').
+    Initially writes 0xFFFFFFFF for RIFF length and data length.
+    When closing, attempts to seek back and update header lengths if seekable,
+    or gracefully leaves 0xFFFFFFFF if unseekable.
+    """
+
+    def __init__(
+        self, stream, nchannels=1, sampwidth=2, framerate=44100, close_on_exit=True
+    ):
+        self.stream = stream
+        self.close_on_exit = close_on_exit
+        self.nchannels = nchannels
+        self.sampwidth = sampwidth
+        self.framerate = framerate
+        self.data_bytes_written = 0
+        self._write_header()
+
+    def setnchannels(self, nchannels):
+        self.nchannels = nchannels
+
+    def setsampwidth(self, sampwidth):
+        self.sampwidth = sampwidth
+
+    def setframerate(self, framerate):
+        self.framerate = framerate
+
+    def setnframes(self, nframes):
+        pass
+
+    def _write_header(self):
+        header = struct.pack(
+            "<4sI4s4sIHHIIHH4sI",
+            b"RIFF",
+            0xFFFFFFFF,  # RIFF chunk size placeholder
+            b"WAVE",
+            b"fmt ",
+            16,  # Subchunk1Size (16 for PCM)
+            1,  # AudioFormat (1 for PCM)
+            self.nchannels,
+            self.framerate,
+            self.framerate * self.nchannels * self.sampwidth,  # ByteRate
+            self.nchannels * self.sampwidth,  # BlockAlign
+            self.sampwidth * 8,  # BitsPerSample
+            b"data",
+            0xFFFFFFFF,  # Data chunk size placeholder
+        )
+        self.stream.write(header)
+
+    def writeframes(self, data):
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            self.stream.write(data)
+            self.data_bytes_written += len(data)
+
+    def close(self):
+        try:
+            if hasattr(self.stream, "seekable") and self.stream.seekable():
+                cur = self.stream.tell()
+                riff_size = min(36 + self.data_bytes_written, 0xFFFFFFFF)
+                data_size = min(self.data_bytes_written, 0xFFFFFFFF)
+                self.stream.seek(4)
+                self.stream.write(struct.pack("<I", riff_size))
+                self.stream.seek(40)
+                self.stream.write(struct.pack("<I", data_size))
+                self.stream.seek(cur)
+        except (io.UnsupportedOperation, OSError, AttributeError):
+            pass
+        finally:
+            if hasattr(self.stream, "flush"):
+                try:
+                    self.stream.flush()
+                except Exception:
+                    pass
+            if (
+                self.close_on_exit
+                and hasattr(self.stream, "close")
+                and self.stream not in (sys.stdout, sys.stdout.buffer)
+            ):
+                try:
+                    self.stream.close()
+                except Exception:
+                    pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+
+def open_wav_write(file_or_path, nchannels=2, sampwidth=2, framerate=44100):
+    """Opens a WAV writer to a path, file object, or '-' (sys.stdout.buffer)."""
+    if file_or_path == "-":
+        return StreamingWavWriter(
+            sys.stdout.buffer,
+            nchannels=nchannels,
+            sampwidth=sampwidth,
+            framerate=framerate,
+            close_on_exit=False,
+        )
+    elif isinstance(file_or_path, str):
+        f = open(file_or_path, "wb")
+        return StreamingWavWriter(
+            f,
+            nchannels=nchannels,
+            sampwidth=sampwidth,
+            framerate=framerate,
+            close_on_exit=True,
+        )
+    else:
+        return StreamingWavWriter(
+            file_or_path,
+            nchannels=nchannels,
+            sampwidth=sampwidth,
+            framerate=framerate,
+            close_on_exit=False,
+        )
+
+
 class PurePythonFlacDecoder:
-    """A pure Python FLAC decoder that streams from disk to save memory."""
+    """A pure Python FLAC decoder that streams from disk or pipes to save memory."""
 
     _CRC8_TABLE = None
 
@@ -21,9 +220,6 @@ class PurePythonFlacDecoder:
     def _get_crc8_table(cls):
         """Memoized computation of the CRC-8 table as a bytearray."""
         if cls._CRC8_TABLE is None:
-            # FLAC frame header CRC-8 table.
-            # Polynomial: x^8 + x^4 + x^3 + x^2 + 1 (0x07).
-            # This polynomial is defined in the FLAC specification (RFC 9639).
             poly = 0x07
             table = bytearray(256)
             for i in range(256):
@@ -37,9 +233,33 @@ class PurePythonFlacDecoder:
             cls._CRC8_TABLE = table
         return cls._CRC8_TABLE
 
-    def __init__(self, file_path):
-        self.f = open(file_path, "rb")
-        self.data_len = os.path.getsize(file_path)
+    def __init__(self, file_path_or_stream):
+        if file_path_or_stream == "-":
+            raw_stream = sys.stdin.buffer
+            self.data_len = float("inf")
+        elif isinstance(file_path_or_stream, str):
+            raw_stream = open(file_path_or_stream, "rb")
+            try:
+                self.data_len = os.path.getsize(file_path_or_stream)
+            except OSError:
+                self.data_len = float("inf")
+        elif hasattr(file_path_or_stream, "read"):
+            raw_stream = file_path_or_stream
+            try:
+                cur = raw_stream.tell()
+                raw_stream.seek(0, os.SEEK_END)
+                self.data_len = raw_stream.tell()
+                raw_stream.seek(cur)
+            except (io.UnsupportedOperation, OSError, AttributeError):
+                self.data_len = float("inf")
+        else:
+            raise ValueError(f"Invalid input source: {file_path_or_stream}")
+
+        if not hasattr(raw_stream, "seekable") or not raw_stream.seekable():
+            self.f = SeekableStreamWrapper(raw_stream)
+        else:
+            self.f = raw_stream
+
         self.offset = 0
 
         self.sample_rate = 44100
@@ -98,15 +318,16 @@ class PurePythonFlacDecoder:
         table = self._get_crc8_table()
         last_reported_decasec = 0  # omit the first report
         while self.offset < self.data_len:
-            if self.samples_yielded >= self.total_samples:
+            if self.total_samples > 0 and self.samples_yielded >= self.total_samples:
                 break
 
             # Print progress at most once per 10 seconds of processed audio
             current_audio_decasec = int(self.samples_yielded / self.sample_rate / 10)
             if current_audio_decasec > last_reported_decasec:
-                percent = min(100.0, (self.offset / self.data_len) * 100.0)
-                sys.stdout.write(f"\rDecoding FLAC: {percent:5.1f}%")
-                sys.stdout.flush()
+                if self.data_len > 0 and self.data_len != float("inf"):
+                    percent = min(100.0, (self.offset / self.data_len) * 100.0)
+                    sys.stderr.write(f"\rDecoding FLAC: {percent:5.1f}%")
+                    sys.stderr.flush()
                 last_reported_decasec = current_audio_decasec
 
             # Fast search for sync byte
@@ -226,7 +447,7 @@ class PurePythonFlacDecoder:
                     r[i] = m - (s >> 1)
 
         for i in range(block_size):
-            if self.samples_yielded >= self.total_samples:
+            if self.total_samples > 0 and self.samples_yielded >= self.total_samples:
                 break
             for ch in range(self.channels):
                 v = subframe_samples[ch][i]
@@ -344,16 +565,18 @@ class PurePythonFlacDecoder:
         return (val >> 1) ^ -(val & 1)
 
     def close(self):
-        sys.stdout.write("\rDecoding FLAC: 100.0% - Complete!\n")
-        sys.stdout.flush()
-        self.f.close()
+        if self.data_len > 0 and self.data_len != float("inf"):
+            sys.stderr.write("\rDecoding FLAC: 100.0% - Complete!\n")
+            sys.stderr.flush()
+        if hasattr(self.f, "close"):
+            self.f.close()
 
 
 class FlacStreamReader:
     """Wraps FlacDecoder to mimic wave.Wave_read without memory buffers."""
 
-    def __init__(self, file_path):
-        self.decoder = PurePythonFlacDecoder(file_path)
+    def __init__(self, file_path_or_stream):
+        self.decoder = PurePythonFlacDecoder(file_path_or_stream)
         self.sample_gen = self.decoder.stream_samples()
 
     def getnchannels(self):
@@ -392,15 +615,14 @@ class FlacStreamReader:
 
 
 def convert_flac_to_wav(in_path, out_path):
-    """Converts a FLAC file to WAV."""
+    """Converts a FLAC file or stream to WAV."""
     with FlacStreamReader(in_path) as fr:
-        with wave.open(out_path, "wb") as fw:
-            fw.setnchannels(fr.getnchannels())
-            fw.setsampwidth(fr.getsampwidth())
-            fw.setframerate(fr.getframerate())
-            if fr.getnframes():
-                fw.setnframes(fr.getnframes())
-
+        with open_wav_write(
+            out_path,
+            nchannels=fr.getnchannels(),
+            sampwidth=fr.getsampwidth(),
+            framerate=fr.getframerate(),
+        ) as fw:
             chunk_size = 65536
             while True:
                 frames = fr.readframes(chunk_size)
@@ -486,8 +708,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Convert FLAC to WAV using a pure Python implementation."
     )
-    parser.add_argument("input", nargs="?", help="Input .flac file")
-    parser.add_argument("output", nargs="?", help="Output .wav file")
+    parser.add_argument("input", nargs="?", help="Input .flac file (or '-' for stdin)")
+    parser.add_argument(
+        "output", nargs="?", help="Output .wav file (or '-' for stdout)"
+    )
     parser.add_argument(
         "--test", action="store_true", help="Run the internal verification test"
     )
@@ -501,9 +725,9 @@ def main():
     if not args.input or not args.output:
         parser.error("Input and output files are required unless --test is specified.")
 
-    print(f"Converting '{args.input}' to '{args.output}'...")
+    print(f"Converting '{args.input}' to '{args.output}'...", file=sys.stderr)
     convert_flac_to_wav(args.input, args.output)
-    print("Done.")
+    print("Done.", file=sys.stderr)
 
 
 if __name__ == "__main__":
