@@ -36,20 +36,25 @@ References Consulted:
 1. IEC Standard 60094-4 & 60094-5: "Magnetic Tape Sound Recording and
    Reproducing Systems" - Standard equalization time constants for Type I cassettes
    (3180 us, 120 us, 12 us).
+   URL: https://webstore.iec.ch/publication/723
+   Wayback Machine: https://web.archive.org/web/20220601/https://webstore.iec.ch/publication/723
 2. Wallace, R. L. (1951): "The Reproduction of Magnetically Recorded Signals",
    Bell System Technical Journal, 30(4), pp. 1145-1173. (Gap and spacing loss equations).
+   URL: https://doi.org/10.1002/j.1538-7305.1951.tb03700.x
 3. Jiles, D. C., & Atherton, D. L. (1986): "Theory of Ferromagnetic Hysteresis",
    Journal of Magnetism and Magnetic Materials, 61(1-2), pp. 48-60. (Anhysteretic
    tape magnetization and AC bias linearization models).
-4. Zölzer, U. (2011): "DAFX: Digital Audio Effects", John Wiley & Sons. (Bilinear
-   transform mapping of continuous-time analog equalizers to discrete IIR filters).
-5. Smith, J. O. (2007): "Physical Audio Signal Processing", W3K Publishing.
-   (Stateful streaming DSP filter implementations and lfilter_zi initial states).
+   URL: https://doi.org/10.1016/0304-8853(86)90066-1
+4. ASCII Corporation / MSX Licensing Corporation (1983): "MSX Technical Data Handbook",
+   Hardware Architecture & I/O Port Specifications.
+   URL: https://web.archive.org/web/20230330/http://map.grauw.nl/resources/msx_io_ports.php
 """
 
 import os
 import sys
 import wave
+import io
+import struct
 import argparse
 import unittest
 import tempfile
@@ -194,6 +199,118 @@ class CassetteStage:
             return out
 
 
+class StreamingWavWriter:
+    """
+    WAV file writer supporting seekable files and unseekable streams (like stdout / '-').
+    Initially writes 0xFFFFFFFF for RIFF length and data length.
+    When closing, attempts to seek back and update header lengths if seekable,
+    or gracefully leaves 0xFFFFFFFF if unseekable.
+    """
+
+    def __init__(
+        self, stream, nchannels=1, sampwidth=2, framerate=44100, close_on_exit=True
+    ):
+        self.stream = stream
+        self.close_on_exit = close_on_exit
+        self.nchannels = nchannels
+        self.sampwidth = sampwidth
+        self.framerate = framerate
+        self.data_bytes_written = 0
+        self._write_header()
+
+    def _write_header(self):
+        header = struct.pack(
+            "<4sI4s4sIHHIIHH4sI",
+            b"RIFF",
+            0xFFFFFFFF,  # RIFF chunk size placeholder
+            b"WAVE",
+            b"fmt ",
+            16,  # Subchunk1Size (16 for PCM)
+            1,  # AudioFormat (1 for PCM)
+            self.nchannels,
+            self.framerate,
+            self.framerate * self.nchannels * self.sampwidth,  # ByteRate
+            self.nchannels * self.sampwidth,  # BlockAlign
+            self.sampwidth * 8,  # BitsPerSample
+            b"data",
+            0xFFFFFFFF,  # Data chunk size placeholder
+        )
+        self.stream.write(header)
+
+    def writeframes(self, data):
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            self.stream.write(data)
+            self.data_bytes_written += len(data)
+
+    def close(self):
+        try:
+            if hasattr(self.stream, "seekable") and self.stream.seekable():
+                cur = self.stream.tell()
+                riff_size = min(36 + self.data_bytes_written, 0xFFFFFFFF)
+                data_size = min(self.data_bytes_written, 0xFFFFFFFF)
+                self.stream.seek(4)
+                self.stream.write(struct.pack("<I", riff_size))
+                self.stream.seek(40)
+                self.stream.write(struct.pack("<I", data_size))
+                self.stream.seek(cur)
+        except (io.UnsupportedOperation, OSError, AttributeError):
+            pass
+        finally:
+            self.stream.flush()
+            if self.close_on_exit:
+                self.stream.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+
+def open_wav_read(file_or_path):
+    """Opens a WAV reader from a path, file object, or '-' (sys.stdin.buffer)."""
+    if file_or_path == "-":
+        return wave.open(sys.stdin.buffer, "rb")
+    elif isinstance(file_or_path, str):
+        return wave.open(file_or_path, "rb")
+    else:
+        return wave.open(file_or_path, "rb")
+
+
+def open_wav_write(file_or_path, nchannels=1, sampwidth=2, framerate=44100):
+    """Opens a WAV writer to a path, file object, or '-' (sys.stdout.buffer)."""
+    if file_or_path == "-":
+        return StreamingWavWriter(
+            sys.stdout.buffer,
+            nchannels=nchannels,
+            sampwidth=sampwidth,
+            framerate=framerate,
+            close_on_exit=False,
+        )
+    elif isinstance(file_or_path, str):
+        f = open(file_or_path, "wb")
+        return StreamingWavWriter(
+            f,
+            nchannels=nchannels,
+            sampwidth=sampwidth,
+            framerate=framerate,
+            close_on_exit=True,
+        )
+    else:
+        return StreamingWavWriter(
+            file_or_path,
+            nchannels=nchannels,
+            sampwidth=sampwidth,
+            framerate=framerate,
+            close_on_exit=False,
+        )
+
+
+def log_info(msg, quiet=False, stream=sys.stderr):
+    if not quiet:
+        print(msg, file=stream)
+
+
 class CassetteAudioProcessor:
     """
     Streaming WAV Cassette Modeler supporting explicitly chained filter stages.
@@ -227,7 +344,7 @@ class CassetteAudioProcessor:
             else:
                 parsed_stages.append(s)
 
-        with wave.open(input_wav_path, "rb") as in_wf:
+        with open_wav_read(input_wav_path) as in_wf:
             n_channels = in_wf.getnchannels()
             sampwidth = in_wf.getsampwidth()
             fs = in_wf.getframerate()
@@ -245,11 +362,9 @@ class CassetteAudioProcessor:
                 for st in parsed_stages
             ]
 
-            with wave.open(output_wav_path, "wb") as out_wf:
-                out_wf.setnchannels(n_channels)
-                out_wf.setsampwidth(sampwidth)
-                out_wf.setframerate(fs)
-
+            with open_wav_write(
+                output_wav_path, nchannels=n_channels, sampwidth=sampwidth, framerate=fs
+            ) as out_wf:
                 while True:
                     raw_bytes = in_wf.readframes(chunk_size)
                     if not raw_bytes:
@@ -445,24 +560,80 @@ class TestCassetteAudioProcessor(unittest.TestCase):
             if os.path.exists(out_path):
                 os.remove(out_path)
 
+    def test_unseekable_header_handling(self):
+        """Verify 0xFFFFFFFF header formatting and graceful unseekable stream handling"""
+        buf = io.BytesIO()
+
+        class UnseekableWrapper:
+            def __init__(self, target):
+                self.target = target
+
+            def write(self, b):
+                return self.target.write(b)
+
+            def flush(self):
+                return self.target.flush()
+
+            def seekable(self):
+                return False
+
+        proc = CassetteAudioProcessor(tape_hiss_level=0.0)
+
+        in_buf = io.BytesIO()
+        with wave.open(in_buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(44100)
+            wf.writeframes(b"\x00\x00" * 100)
+        in_buf.seek(0)
+
+        proc.process_stream(in_buf, UnseekableWrapper(buf), mode="record+playback")
+        val = buf.getvalue()
+        self.assertEqual(val[4:8], b"\xff\xff\xff\xff")
+        self.assertEqual(val[40:44], b"\xff\xff\xff\xff")
+
+
+def run_tests():
+    log_info("Executing unit test suite...", quiet=False, stream=sys.stdout)
+    suite = unittest.TestLoader().loadTestsFromTestCase(TestCassetteAudioProcessor)
+    runner = unittest.TextTestRunner(verbosity=2, stream=sys.stdout)
+    result = runner.run(suite)
+    if not result.wasSuccessful():
+        sys.exit(1)
+
 
 def main():
-    if "--test" in sys.argv:
-        print("Executing unit test suite...")
-        test_argv = [sys.argv[0]] + [a for a in sys.argv[1:] if a != "--test"]
-        unittest.main(argv=test_argv)
-        return
-
     parser = argparse.ArgumentParser(
-        description="Audio Cassette Modeler with Explicit Filter Chaining (+)"
+        description="Audio Cassette Modeler with Explicit Filter Chaining (+)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
     )
-    parser.add_argument("-i", "--input", help="Path to input WAV file")
-    parser.add_argument("-o", "--output", help="Path to output WAV file")
+    parser.add_argument("input", nargs="?", help="input .wav file (or '-' for stdin)")
+    parser.add_argument(
+        "output", nargs="?", help="output .wav file (or '-' for stdout)"
+    )
+    parser.add_argument(
+        "-i", "--input-file", "--input", dest="input_opt", help="Path to input WAV file"
+    )
+    parser.add_argument(
+        "-o",
+        "--output-file",
+        "--output",
+        dest="output_opt",
+        help="Path to output WAV file",
+    )
     parser.add_argument(
         "-m",
         "--mode",
         default="record+playback",
-        help="Filter sequence separated by '+' (e.g., 'record+playback', 'playback+record', 'record+playback+record+playback')",
+        help="Filter sequence separated by '+' (e.g., 'record+playback', 'playback+record') (default: record+playback)",
+    )
+    parser.add_argument(
+        "-c",
+        "--chunk-size",
+        type=int,
+        default=4096,
+        help="Chunk size in frames for streaming processing (default: 4096)",
     )
     parser.add_argument(
         "--drive",
@@ -477,21 +648,48 @@ def main():
         help="Tape hiss noise level (default: 0.001)",
     )
     parser.add_argument(
-        "--test", action="store_true", help="Run embedded unit test suite"
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="suppress non-error diagnostic output",
+    )
+    parser.add_argument(
+        "--test", action="store_true", help="run internal self-tests and exit"
     )
 
     args = parser.parse_args()
 
-    if not args.input or not args.output:
-        parser.print_help()
+    if args.test:
+        run_tests()
+        return
+
+    input_path = args.input_opt or args.input
+    output_path = args.output_opt or args.output
+
+    if not input_path and not output_path:
+        parser.print_usage(sys.stderr)
+        sys.exit(2)
+
+    input_path = input_path or "-"
+    output_path = output_path or "-"
+
+    if input_path != "-" and not os.path.exists(input_path):
+        print(f"Error: Input file '{input_path}' not found.", file=sys.stderr)
         sys.exit(1)
 
     processor = CassetteAudioProcessor(
         saturation_drive=args.drive, tape_hiss_level=args.hiss
     )
-    processor.process_stream(args.input, args.output, mode=args.mode)
-    print(
-        f"Successfully processed '{args.input}' -> '{args.output}' using chain: [{args.mode}]."
+    log_info(
+        f"Processing '{input_path}' -> '{output_path}' using chain: [{args.mode}]...",
+        quiet=args.quiet,
+    )
+    processor.process_stream(
+        input_path, output_path, mode=args.mode, chunk_size=args.chunk_size
+    )
+    log_info(
+        f"Successfully processed '{input_path}' -> '{output_path}' using chain: [{args.mode}].",
+        quiet=args.quiet,
     )
 
 
