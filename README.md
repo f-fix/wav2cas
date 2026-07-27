@@ -85,7 +85,7 @@ options:
                         number of stop bits required per byte in strict mode
                         (default: 2)
   --min-confidence MIN_CONFIDENCE
-                        minimum block confidence threshold (default: 0.8)
+                        minimum block confidence threshold (default: 0.75)
   --no-edge-trim        disable automatic trimming of low-confidence bytes
   --edge-trim-threshold EDGE_TRIM_THRESHOLD
                         edge trim confidence threshold (default: 0.5)
@@ -179,15 +179,16 @@ CMT Audio Shaping Circuits Streaming WAV Filter
 options:
   -h, --help            show this help message and exit
   --test                Run the test suite
-  -m, --mode MODE       Filter mode: 'input' (CMT-IN -> IOA7), 'output' (PC5
-                        -> CMT OUT), or a chain such as 'output+input' /
-                        'output,input' to simulate a full record->playback
-                        round trip through a cassette deck.
-  -i, --input-file INPUT_FILE
+  -m MODE, --mode MODE  Filter mode: 'input' (CMT-IN -> IOA7), 'output' (PC5
+                        -> CMT OUT), 'ttl' (PPI TTL logic level), or a chain
+                        such as 'input+ttl+output' / 'output+input' to
+                        simulate a full record->playback round trip through a
+                        cassette deck.
+  -i INPUT_FILE, --input-file INPUT_FILE
                         Path to input WAV file
-  -o, --output-file OUTPUT_FILE
+  -o OUTPUT_FILE, --output-file OUTPUT_FILE
                         Path to output WAV file
-  -c, --chunk-size CHUNK_SIZE
+  -c CHUNK_SIZE, --chunk-size CHUNK_SIZE
                         Chunk size in frames for streaming processing
                         (default: 1024)
   --tape-gain-db TAPE_GAIN_DB
