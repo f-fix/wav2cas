@@ -72,7 +72,7 @@ Component & Circuit Effects:
   Reduces 5V peak-to-peak TTL output down to ~100 mV peak-to-peak MIC/LINE level.
 
 - Combined Exact Transfer Function H_out(s):
-  H_out(s) = (C31 * R39 * s) / [ (C31 * C32 * R41 * (R39 + R40)) * s^2 + (C31*(R39+R40+R41) + C32*(R39+R40)) * s + 1 ]
+  H_out(s) = (C31 * R39 * s) / [ (C31 * C32 * R41 * (R39 + R40))*s^2 + (C31*(R39+R40+R41) + C32*(R39+R40)) * s + 1 ]
 
 References Consulted:
 ---------------------
@@ -422,8 +422,17 @@ def open_wav_write(file_or_path, nchannels=1, sampwidth=2, framerate=44100):
 def process_wav_stream(input_source, output_target, filter_obj, chunk_size: int = 1024):
     """
     Streams audio chunk-by-chunk from input_source through filter_obj to output_target.
+    input_source can be a path, a file-like object, or an already opened wave.Wave_read object.
     """
-    with open_wav_read(input_source) as infile:
+    # If input_source is already a Wave_read object, use it. Otherwise open it.
+    if hasattr(input_source, "getnchannels"):
+        infile = input_source
+        should_close_in = False
+    else:
+        infile = open_wav_read(input_source)
+        should_close_in = True
+
+    try:
         nchannels = infile.getnchannels()
         sampwidth = infile.getsampwidth()
         framerate = infile.getframerate()
@@ -457,6 +466,9 @@ def process_wav_stream(input_source, output_target, filter_obj, chunk_size: int 
                 # Convert back to int16 PCM
                 out_int16 = np.clip(processed * 32767.0, -32768, 32767).astype(np.int16)
                 outfile.writeframes(out_int16.tobytes())
+    finally:
+        if should_close_in:
+            infile.close()
 
 
 def log_info(msg, quiet=False, stream=sys.stderr):
@@ -581,8 +593,8 @@ class TestCMTAudioFiltersExact(unittest.TestCase):
 
         process_wav_stream(in_buf, UnseekableWrapper(buf), chained)
         val = buf.getvalue()
-        self.assertEqual(val[4:8], b"\xff\xff\xff\xff")
-        self.assertEqual(val[40:44], b"\xff\xff\xff\xff")
+        self.assertEqual(val[4:8], bytes([0xFF] * 4))
+        self.assertEqual(val[40:44], bytes([0xFF] * 4))
 
 
 def run_tests():
@@ -672,28 +684,40 @@ def main():
         print(f"Error: Input file '{input_path}' not found.", file=sys.stderr)
         sys.exit(1)
 
-    # Read input sample rate
-    with open_wav_read(input_path) as wf:
-        sample_rate = wf.getframerate()
-
-    try:
-        stages = _build_filter_chain(
-            args.mode, sample_rate, tape_gain_db=args.tape_gain_db
-        )
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    stage_desc = " -> ".join(name for name, _ in stages)
     log_info(
-        f"Processing '{input_path}' -> '{output_path}' using chain: [{stage_desc}]...",
+        f"Processing '{input_path}' -> '{output_path}' using chain: [{args.mode}]...",
         quiet=args.quiet,
     )
-    filter_obj = ChainedFilter(stages)
 
-    process_wav_stream(input_path, output_path, filter_obj, chunk_size=args.chunk_size)
     log_info(
-        f"Successfully processed '{input_path}' -> '{output_path}' using chain: [{stage_desc}].",
+        f"Processing '{input_path}' -> '{output_path}' using chain: [{args.mode}]...",
+        quiet=args.quiet,
+    )
+
+    # Open input once
+    input_wav = open_wav_read(input_path)
+    try:
+        sample_rate = input_wav.getframerate()
+
+        try:
+            stages = _build_filter_chain(
+                args.mode, sample_rate, tape_gain_db=args.tape_gain_db
+            )
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        chain_str = "+".join(name for name, _ in stages)
+        filter_obj = ChainedFilter(stages)
+
+        process_wav_stream(
+            input_wav, output_path, filter_obj, chunk_size=args.chunk_size
+        )
+    finally:
+        input_wav.close()
+
+    log_info(
+        f"Successfully processed '{input_path}' -> '{output_path}' using chain: [{chain_str}].",
         quiet=args.quiet,
     )
 
