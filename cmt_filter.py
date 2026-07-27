@@ -7,13 +7,15 @@
 The Cassette Magnetic Tape (CMT) interface circuits in MSX and
 MSX-like computers handle signal conversion between analog audio
 signals on magnetic tape and digital logic signals inside the MSX
-or MSX-like system.
+system. Reading from cassette uses the PSG/SSG (AY-3-8910 / YM2149)
+I/O Port A Bit 7 (IOA7). Writing to cassette uses the PPI (8255)
+Port C Bit 5 (PC5).
 
-2. Input Circuit Analysis: CMT-IN -> IOA7 (Fig. 5-5-9)
-------------------------------------------------------
+2. Input Circuit Analysis: CMT-IN -> PSG IOA7 (Fig. 5-5-9)
+----------------------------------------------------------
 This circuit takes the raw, noisy analog audio signal coming from a cassette player
 (CMT-IN / CN4-5) and converts it into a clean digital 0V / 5V square wave fed into
-IOA7 (Bit 7 of I/O Port A on the AY-3-8910 / YM2149 PSG sound chip).
+IOA7 (Bit 7 of I/O Port A on the AY-3-8910 / YM2149 PSG / SSG sound chip).
 
 Component & Circuit Effects:
 - High-Pass Filter (C31 = 0.1 uF, R21 = 2.7 kOhm):
@@ -36,10 +38,17 @@ Component & Circuit Effects:
 
 - Comparator with Hysteresis (R33 = 4.7 kOhm, JRC-311B):
   Acts as a zero-crossing Schmitt trigger comparator, converting the filtered
-  AC waveform into a sharp 0V / 5V square wave for digital reading by IOA7.
+  AC waveform into a sharp 0V / 5V square wave for digital reading by PSG IOA7.
 
-3. Output Circuit Analysis: PC5 -> CMT OUT (Fig. 5-4-10)
---------------------------------------------------------
+3. TTL / Data Slicer Filter Stage: CMTAudioTTLFilter ('ttl', 'slicer')
+------------------------------------------------------------------------
+Models the digital logic level thresholding and data slicing (0.0V logic low,
+1.0V logic high) at the MSX digital I/O interface (PSG IOA7 for input, PPI PC5 for output).
+Converts thresholded comparator outputs (-1.0 / +1.0) or continuous audio signals into
+unipolar 0.0 / 1.0 digital streams. 'slicer' is supported as an alias for 'ttl'.
+
+4. Output Circuit Analysis: PPI PC5 -> CMT OUT (Fig. 5-4-10)
+------------------------------------------------------------
 This circuit takes digital 0V / 5V pulse streams from PPI (8255) pin PC5, smooths
 the sharp transitions into a band-limited wave, attenuates the voltage to
 microphone/line level, and sends it to CN4-4 CMT OUT. It also includes a relay motor
@@ -65,11 +74,24 @@ Component & Circuit Effects:
 - Combined Exact Transfer Function H_out(s):
   H_out(s) = (C31 * R39 * s) / [ (C31 * C32 * R41 * (R39 + R40)) * s^2 + (C31*(R39+R40+R41) + C32*(R39+R40)) * s + 1 ]
 
+References Consulted:
+---------------------
+1. Yamaha Corporation (1984): "Yamaha CX5M / YIS-503 Music Computer Service Manual",
+   - Fig. 5-5-9: CMT-IN Cassette Interface Input Shaping Circuit (C31, R21, R20, C29, D1/D2, R33, JRC-311B comparator -> PSG IOA7).
+   - Fig. 5-4-10: PPI PC5 -> CMT OUT Cassette Interface Output Shaping Circuit (PPI PC5 -> 74LS14 4B inverter, C31, R41, C32, R40/R39 attenuator).
+   URL: https://archive.org/details/yamaha_cx5mu_service-manual
+2. ASCII Corporation / MSX Licensing Corporation (1983): "MSX Technical Data Handbook / MSX BIOS Specification",
+   - PSG (AY-3-8910 / YM2149) Register 14 (I/O Port A), Bit 7: Cassette Data Input (CMT IN).
+   - PPI (8255) Register C (I/O Port C), Bit 5: Cassette Data Output (CMT OUT).
+   URL: https://web.archive.org/web/20230330/http://map.grauw.nl/resources/msx_io_ports.php
+
 """
 
 import sys
 import os
 import wave
+import io
+import struct
 import argparse
 import unittest
 import numpy as np
@@ -156,6 +178,7 @@ class CMTAudioInputFilterExact:
     Exact transfer function derived from circuit components:
     H(s) = (C31*R21*s) / [ (C29*C31*R20*R21)*s^2 + (C29*R20 + C29*R21 + C31*R21)*s + 1 ]
     Followed by anti-parallel diode clamping and Schmitt trigger comparator.
+    Output drives PSG/SSG (AY-3-8910 / YM2149) I/O Port A Bit 7 (IOA7).
     """
 
     def __init__(self, sample_rate=44100, v_clamp=0.6, hysteresis_v=0.05):
@@ -204,9 +227,10 @@ class CMTAudioInputFilterExact:
 
 class CMTAudioTTLFilter:
     """
-    Models TTL logic level shaping (0.0 V logic low, 1.0 V / 5V logic high).
+    Models TTL / digital logic level shaping and data slicing (0.0 V logic low, 1.0 V / 5V logic high).
     Converts comparator outputs (-1.0 / +1.0) or thresholded audio into
-    0.0 / 1.0 TTL logic level representation.
+    0.0 / 1.0 TTL / digital logic level representation.
+    Supported stage mode aliases: 'ttl', 'slicer'.
     """
 
     def __init__(self, threshold=0.0):
@@ -243,7 +267,7 @@ class TapeChannelGain:
 def _build_filter_chain(mode_spec, sample_rate, tape_gain_db=None):
     """
     Builds a list of (name, filter_obj) stages from a mode spec like
-    'output', 'input', 'ttl', 'input+ttl+output', or 'output,input'.
+    'output', 'input', 'ttl', 'slicer', 'input+ttl+output', or 'output,input'.
     If tape_gain_db is given, a TapeChannelGain stage is inserted right after
     each 'output' stage to model tape recording/playback level loss or gain
     (see TapeChannelGain docstring). By default (tape_gain_db=None) no such
@@ -254,16 +278,16 @@ def _build_filter_chain(mode_spec, sample_rate, tape_gain_db=None):
         m.strip().lower() for m in mode_spec.replace("+", ",").split(",") if m.strip()
     ]
     for m in modes:
-        if m not in ("input", "output", "ttl"):
+        if m not in ("input", "output", "ttl", "slicer"):
             raise ValueError(
-                f"Unknown mode '{m}' (expected 'input', 'output', or 'ttl')"
+                f"Unknown mode '{m}' (expected 'input', 'output', 'ttl', or 'slicer')"
             )
 
     stages = []
     for m in modes:
         if m == "input":
             stages.append(("input", CMTAudioInputFilterExact(sample_rate=sample_rate)))
-        elif m == "ttl":
+        elif m in ("ttl", "slicer"):
             stages.append(("ttl", CMTAudioTTLFilter()))
         else:
             stages.append(
@@ -288,22 +312,125 @@ class ChainedFilter:
         return chunk
 
 
-def process_wav_file(
-    input_wav_path: str, output_wav_path: str, filter_obj, chunk_size: int = 1024
-):
+class StreamingWavWriter:
     """
-    Streams a WAV file chunk-by-chunk through the given filter object and saves to output_wav_path.
+    WAV file writer supporting seekable files and unseekable streams (like stdout / '-').
+    Initially writes 0xFFFFFFFF for RIFF length and data length.
+    When closing, attempts to seek back and update header lengths if seekable,
+    or gracefully leaves 0xFFFFFFFF if unseekable.
     """
-    with wave.open(input_wav_path, "rb") as infile:
+
+    def __init__(
+        self, stream, nchannels=1, sampwidth=2, framerate=44100, close_on_exit=True
+    ):
+        self.stream = stream
+        self.close_on_exit = close_on_exit
+        self.nchannels = nchannels
+        self.sampwidth = sampwidth
+        self.framerate = framerate
+        self.data_bytes_written = 0
+        self._write_header()
+
+    def _write_header(self):
+        header = struct.pack(
+            "<4sI4s4sIHHIIHH4sI",
+            b"RIFF",
+            0xFFFFFFFF,  # RIFF chunk size placeholder
+            b"WAVE",
+            b"fmt ",
+            16,  # Subchunk1Size (16 for PCM)
+            1,  # AudioFormat (1 for PCM)
+            self.nchannels,
+            self.framerate,
+            self.framerate * self.nchannels * self.sampwidth,  # ByteRate
+            self.nchannels * self.sampwidth,  # BlockAlign
+            self.sampwidth * 8,  # BitsPerSample
+            b"data",
+            0xFFFFFFFF,  # Data chunk size placeholder
+        )
+        self.stream.write(header)
+
+    def writeframes(self, data):
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            self.stream.write(data)
+            self.data_bytes_written += len(data)
+
+    def close(self):
+        try:
+            if hasattr(self.stream, "seekable") and self.stream.seekable():
+                cur = self.stream.tell()
+                riff_size = min(36 + self.data_bytes_written, 0xFFFFFFFF)
+                data_size = min(self.data_bytes_written, 0xFFFFFFFF)
+                self.stream.seek(4)
+                self.stream.write(struct.pack("<I", riff_size))
+                self.stream.seek(40)
+                self.stream.write(struct.pack("<I", data_size))
+                self.stream.seek(cur)
+        except (io.UnsupportedOperation, OSError, AttributeError):
+            pass
+        finally:
+            self.stream.flush()
+            if self.close_on_exit:
+                self.stream.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+
+def open_wav_read(file_or_path):
+    """Opens a WAV reader from a path, file object, or '-' (sys.stdin.buffer)."""
+    if file_or_path == "-":
+        return wave.open(sys.stdin.buffer, "rb")
+    elif isinstance(file_or_path, str):
+        return wave.open(file_or_path, "rb")
+    else:
+        return wave.open(file_or_path, "rb")
+
+
+def open_wav_write(file_or_path, nchannels=1, sampwidth=2, framerate=44100):
+    """Opens a WAV writer to a path, file object, or '-' (sys.stdout.buffer)."""
+    if file_or_path == "-":
+        return StreamingWavWriter(
+            sys.stdout.buffer,
+            nchannels=nchannels,
+            sampwidth=sampwidth,
+            framerate=framerate,
+            close_on_exit=False,
+        )
+    elif isinstance(file_or_path, str):
+        f = open(file_or_path, "wb")
+        return StreamingWavWriter(
+            f,
+            nchannels=nchannels,
+            sampwidth=sampwidth,
+            framerate=framerate,
+            close_on_exit=True,
+        )
+    else:
+        return StreamingWavWriter(
+            file_or_path,
+            nchannels=nchannels,
+            sampwidth=sampwidth,
+            framerate=framerate,
+            close_on_exit=False,
+        )
+
+
+def process_wav_stream(input_source, output_target, filter_obj, chunk_size: int = 1024):
+    """
+    Streams audio chunk-by-chunk from input_source through filter_obj to output_target.
+    """
+    with open_wav_read(input_source) as infile:
         nchannels = infile.getnchannels()
         sampwidth = infile.getsampwidth()
         framerate = infile.getframerate()
 
-        with wave.open(output_wav_path, "wb") as outfile:
-            outfile.setnchannels(1)  # mono output
-            outfile.setsampwidth(2)  # 16-bit PCM
-            outfile.setframerate(framerate)
-
+        with open_wav_write(
+            output_target, nchannels=1, sampwidth=2, framerate=framerate
+        ) as outfile:
             while True:
                 frames = infile.readframes(chunk_size)
                 if not frames:
@@ -330,6 +457,11 @@ def process_wav_file(
                 # Convert back to int16 PCM
                 out_int16 = np.clip(processed * 32767.0, -32768, 32767).astype(np.int16)
                 outfile.writeframes(out_int16.tobytes())
+
+
+def log_info(msg, quiet=False, stream=sys.stderr):
+    if not quiet:
+        print(msg, file=stream)
 
 
 class TestCMTAudioFiltersExact(unittest.TestCase):
@@ -369,6 +501,14 @@ class TestCMTAudioFiltersExact(unittest.TestCase):
         chunk = np.array([-1.0, 0.5, -0.2, 0.8], dtype=np.float32)
         out = ttl_filt.process_chunk(chunk)
         self.assertTrue(np.array_equal(out, [0.0, 1.0, 0.0, 1.0]))
+
+    def test_slicer_alias(self):
+        fs = 44100
+        stages_ttl = _build_filter_chain("ttl", fs)
+        stages_slicer = _build_filter_chain("slicer", fs)
+        self.assertEqual(len(stages_ttl), 1)
+        self.assertEqual(len(stages_slicer), 1)
+        self.assertIsInstance(stages_slicer[0][1], CMTAudioTTLFilter)
 
     def test_input_filter_reconstruction(self):
         fs = 44100
@@ -411,34 +551,44 @@ class TestCMTAudioFiltersExact(unittest.TestCase):
         self.assertEqual(set(np.unique(settled_tail)), {-1.0, 1.0})
         self.assertGreater(np.sum(np.diff(out) != 0), 100)
 
-    def test_wav_processing(self):
-        fs = 44100
-        test_in = "temp_test_in.wav"
-        test_out = "temp_test_out.wav"
+    def test_unseekable_header_handling(self):
+        buf = io.BytesIO()
 
-        t = np.linspace(0, 0.1, int(fs * 0.1), endpoint=False)
-        sig = np.sin(2 * np.pi * 1200 * t).astype(np.float32)
+        class UnseekableWrapper:
+            def __init__(self, target):
+                self.target = target
 
-        with wave.open(test_in, "wb") as wf:
+            def write(self, b):
+                return self.target.write(b)
+
+            def flush(self):
+                return self.target.flush()
+
+            def seekable(self):
+                return False
+
+        out_filt = CMTAudioOutputFilterExact(sample_rate=44100)
+        stages = [("output", out_filt)]
+        chained = ChainedFilter(stages)
+
+        in_buf = io.BytesIO()
+        with wave.open(in_buf, "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
-            wf.setframerate(fs)
-            wf.writeframes((sig * 32767).astype(np.int16).tobytes())
+            wf.setframerate(44100)
+            wf.writeframes(b"\x00\x00" * 100)
+        in_buf.seek(0)
 
-        out_filt = CMTAudioOutputFilterExact(sample_rate=fs)
-        process_wav_file(test_in, test_out, out_filt, chunk_size=256)
-
-        self.assertTrue(os.path.exists(test_out))
-        if os.path.exists(test_in):
-            os.remove(test_in)
-        if os.path.exists(test_out):
-            os.remove(test_out)
+        process_wav_stream(in_buf, UnseekableWrapper(buf), chained)
+        val = buf.getvalue()
+        self.assertEqual(val[4:8], b"\xff\xff\xff\xff")
+        self.assertEqual(val[40:44], b"\xff\xff\xff\xff")
 
 
 def run_tests():
-    print("Running CMT Audio Filter Test Suite...")
+    log_info("Running CMT Audio Filter Test Suite...", quiet=False, stream=sys.stdout)
     suite = unittest.TestLoader().loadTestsFromTestCase(TestCMTAudioFiltersExact)
-    runner = unittest.TextTestRunner(verbosity=2)
+    runner = unittest.TextTestRunner(verbosity=2, stream=sys.stdout)
     result = runner.run(suite)
     if not result.wasSuccessful():
         sys.exit(1)
@@ -451,16 +601,29 @@ def main():
         epilog=__doc__,
     )
 
-    parser.add_argument("--test", action="store_true", help="Run the test suite")
+    parser.add_argument("input", nargs="?", help="input .wav file (or '-' for stdin)")
+    parser.add_argument(
+        "output", nargs="?", help="output .wav file (or '-' for stdout)"
+    )
+    parser.add_argument(
+        "-i", "--input-file", "--input", dest="input_opt", help="Path to input WAV file"
+    )
+    parser.add_argument(
+        "-o",
+        "--output-file",
+        "--output",
+        dest="output_opt",
+        help="Path to output WAV file",
+    )
     parser.add_argument(
         "-m",
         "--mode",
-        help="Filter mode: 'input' (CMT-IN -> IOA7), 'output' (PC5 -> CMT OUT), 'ttl' (PPI TTL logic level), "
+        default="input",
+        help="Filter mode: 'input' (CMT-IN -> IOA7), 'output' (PC5 -> CMT OUT), "
+        "'ttl' / 'slicer' (data slicer filter for TTL/CMOS logic level), "
         "or a chain such as 'input+ttl+output' / 'output+input' to simulate a full "
-        "record->playback round trip through a cassette deck.",
+        "record->playback round trip through a cassette deck (default: input).",
     )
-    parser.add_argument("-i", "--input-file", help="Path to input WAV file")
-    parser.add_argument("-o", "--output-file", help="Path to output WAV file")
     parser.add_argument(
         "-c",
         "--chunk-size",
@@ -479,6 +642,15 @@ def main():
         "electrical peak to full WAV scale. Omit to leave levels as-is "
         "(default: no extra stage added).",
     )
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="suppress non-error diagnostic output",
+    )
+    parser.add_argument(
+        "--test", action="store_true", help="run internal self-tests and exit"
+    )
 
     args = parser.parse_args()
 
@@ -486,19 +658,22 @@ def main():
         run_tests()
         return
 
-    if not args.mode or not args.input_file or not args.output_file:
-        parser.print_help()
-        print(
-            "\nError: --mode, --input-file, and --output-file are required when not running in --test mode."
-        )
-        sys.exit(1)
+    input_path = args.input_opt or args.input
+    output_path = args.output_opt or args.output
 
-    if not os.path.exists(args.input_file):
-        print(f"Error: Input file '{args.input_file}' not found.")
+    if not input_path and not output_path:
+        parser.print_usage(sys.stderr)
+        sys.exit(2)
+
+    input_path = input_path or "-"
+    output_path = output_path or "-"
+
+    if input_path != "-" and not os.path.exists(input_path):
+        print(f"Error: Input file '{input_path}' not found.", file=sys.stderr)
         sys.exit(1)
 
     # Read input sample rate
-    with wave.open(args.input_file, "rb") as wf:
+    with open_wav_read(input_path) as wf:
         sample_rate = wf.getframerate()
 
     try:
@@ -506,17 +681,21 @@ def main():
             args.mode, sample_rate, tape_gain_db=args.tape_gain_db
         )
     except ValueError as e:
-        print(f"Error: {e}")
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
     stage_desc = " -> ".join(name for name, _ in stages)
-    print(f"Applying CMT Audio filter chain [{stage_desc}] on '{args.input_file}'...")
+    log_info(
+        f"Processing '{input_path}' -> '{output_path}' using chain: [{stage_desc}]...",
+        quiet=args.quiet,
+    )
     filter_obj = ChainedFilter(stages)
 
-    process_wav_file(
-        args.input_file, args.output_file, filter_obj, chunk_size=args.chunk_size
+    process_wav_stream(input_path, output_path, filter_obj, chunk_size=args.chunk_size)
+    log_info(
+        f"Successfully processed '{input_path}' -> '{output_path}' using chain: [{stage_desc}].",
+        quiet=args.quiet,
     )
-    print(f"Processing complete. Output written to '{args.output_file}'.")
 
 
 if __name__ == "__main__":
